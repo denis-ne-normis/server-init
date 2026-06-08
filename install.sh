@@ -33,6 +33,7 @@ SUB_PORT="${SUB_PORT:-2096}"                   # порт подписки 3x-ui
 AGG_PORT="${AGG_PORT:-2087}"                   # порт раздачи (персональные страницы /p)
 BLOCK_SMTP="${BLOCK_SMTP:-1}"                  # 1 = блокировать исходящий SMTP
 CHECK_RUSSIA="${CHECK_RUSSIA:-1}"             # 1 = проверить доступность портов из РФ
+ENABLE_LE="${ENABLE_LE:-1}"                     # 1 = валидный сертификат через sslip.io + Let's Encrypt (без предупреждений)
 FORCE_REINSTALL="${FORCE_REINSTALL:-0}"
 REPO_REF="${REPO_REF:-main}"                    # ветка/коммит репозитория для дозагрузки aggsub.py
 
@@ -179,18 +180,31 @@ ok "клиентов: $NP ($(echo "$PEOPLE" | jq -r '[.[].name]|join(", ")'))"
 step "Хардинг панели + HTTPS"
 XUI_DB="/etc/x-ui/x-ui.db"
 "$XUIBIN" setting -username "$PANEL_USER" -password "$PANEL_PASS" -port "$PANEL_PORT" -webBasePath "$PANEL_PATH_RAW" >>"$LOG" 2>&1
-# В 3x-ui 3.2.8 CLI -webCert НЕ сохраняет cert (не создаёт ключи в БД) → пишем webCertFile/webKeyFile напрямую в БД.
-EXISTING_CERT="$(sqlite3 "$XUI_DB" "SELECT value FROM settings WHERE key='webCertFile';" 2>/dev/null || true)"
-if [ -z "$EXISTING_CERT" ] || [ ! -f "$EXISTING_CERT" ]; then
+# Валидный сертификат без своего домена: sslip.io (резолвит IP) + Let's Encrypt (acme.sh, standalone порт 80).
+LE_HOST="${PUBIP//./-}.sslip.io"; PANEL_HOST="$PUBIP"; PANEL_CERT=""; PANEL_KEY=""
+if [ "$ENABLE_LE" = "1" ] && getent hosts "$LE_HOST" >/dev/null 2>&1; then
+  [ -f /root/.acme.sh/acme.sh ] || curl -s https://get.acme.sh | sh -s email="admin@$LE_HOST" >>"$LOG" 2>&1
+  ACME=/root/.acme.sh/acme.sh
+  [ -f "$ACME" ] && "$ACME" --set-default-ca --server letsencrypt >>"$LOG" 2>&1 || true
+  if [ -f "$ACME" ] && { [ -d "/root/.acme.sh/${LE_HOST}_ecc" ] || "$ACME" --issue -d "$LE_HOST" --standalone --keylength ec-256 >>"$LOG" 2>&1; }; then
+    mkdir -p /root/cert/le
+    "$ACME" --install-cert -d "$LE_HOST" --ecc --fullchain-file /root/cert/le/fullchain.pem --key-file /root/cert/le/private.key \
+      --reloadcmd "systemctl restart x-ui; systemctl restart aggsub 2>/dev/null || true" >>"$LOG" 2>&1
+    PANEL_CERT=/root/cert/le/fullchain.pem; PANEL_KEY=/root/cert/le/private.key; PANEL_HOST="$LE_HOST"
+    ok "Let's Encrypt сертификат для $LE_HOST — открывается без предупреждений"
+  else warn "LE не выпустился (порт 80 закрыт/занят?) — ставлю self-signed"; fi
+fi
+if [ -z "$PANEL_CERT" ]; then
   mkdir -p /root/cert/panel
   openssl req -x509 -nodes -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -days 3650 \
     -keyout /root/cert/panel/private.key -out /root/cert/panel/cert.crt \
     -subj "/CN=$PUBIP" -addext "subjectAltName=IP:$PUBIP" >>"$LOG" 2>&1
   PANEL_CERT=/root/cert/panel/cert.crt; PANEL_KEY=/root/cert/panel/private.key
-  systemctl stop x-ui 2>/dev/null || true
-  sqlite3 "$XUI_DB" "DELETE FROM settings WHERE key IN ('webCertFile','webKeyFile'); INSERT INTO settings (key,value) VALUES ('webCertFile','$PANEL_CERT'),('webKeyFile','$PANEL_KEY');"
-  ok "self-signed сертификат панели (HTTPS)"
-else PANEL_CERT="$EXISTING_CERT"; PANEL_KEY="$(sqlite3 "$XUI_DB" "SELECT value FROM settings WHERE key='webKeyFile';" 2>/dev/null)"; ok "сертификат панели: $PANEL_CERT"; fi
+  ok "self-signed сертификат (браузер предупредит 1 раз — это норма)"
+fi
+# В 3x-ui 3.2.8 CLI -webCert НЕ работает → пишем webCertFile/webKeyFile напрямую в БД.
+systemctl stop x-ui 2>/dev/null || true
+sqlite3 "$XUI_DB" "DELETE FROM settings WHERE key IN ('webCertFile','webKeyFile'); INSERT INTO settings (key,value) VALUES ('webCertFile','$PANEL_CERT'),('webKeyFile','$PANEL_KEY');"
 systemctl enable x-ui >>"$LOG" 2>&1 || true; systemctl restart x-ui; sleep 2
 PANEL_PORT="$("$XUIBIN" setting -show 2>/dev/null | grep -i '^port' | awk '{print $2}')"
 PANEL_PATH="$("$XUIBIN" setting -show 2>/dev/null | grep -i 'webBasePath' | awk '{print $2}')"
@@ -265,6 +279,7 @@ table inet filter {
         ip protocol icmp accept
         ip6 nexthdr ipv6-icmp accept
         tcp dport 22 accept
+        tcp dport 80 accept
         tcp dport $PANEL_PORT accept
         tcp dport $VLESS_PORT accept
         tcp dport $SUB_PORT accept
@@ -362,16 +377,17 @@ AWG_SUBNET=$AWG_SUBNET
 AWG_SRV_PRIV=$AWG_SRV_PRIV
 SUB_PORT=$SUB_PORT
 AGG_PORT=$AGG_PORT
+PANEL_HOST=$PANEL_HOST
 CLIENTS_JSON='$PEOPLE'
 EOF
 chmod 600 "$SECRETS"
 {
   echo "# VPN handoff ($PUBIP)"; echo
-  echo "Панель:  https://$PUBIP:$PANEL_PORT$PANEL_PATH"; echo "Логин:   $PANEL_USER"; echo "Пароль:  $PANEL_PASS"; echo
+  echo "Панель:  https://$PANEL_HOST:$PANEL_PORT$PANEL_PATH"; echo "Логин:   $PANEL_USER"; echo "Пароль:  $PANEL_PASS"; echo
   echo "VLESS: Reality+Vision TCP/$VLESS_PORT, донор $SNI_DONOR (Xray $XRAY_VER)"
   echo "AmneziaWG 2.0: UDP/$AWG_PORT, подсеть $AWG_SUBNET.0/24"
   echo "Персональные страницы (QR + оба конфига):"
-  echo "$PEOPLE" | jq -r --arg ip "$PUBIP" --arg ap "$AGG_PORT" '.[]|"  \(.name): https://\($ip):\($ap)/p/\(.sub)"'
+  echo "$PEOPLE" | jq -r --arg ip "$PANEL_HOST" --arg ap "$AGG_PORT" '.[]|"  \(.name): https://\($ip):\($ap)/p/\(.sub)"'
 } > "$HANDOFF"; chmod 600 "$HANDOFF"
 ok "сохранено: $SECRETS · $HANDOFF"
 
@@ -380,11 +396,11 @@ echo -e "\n${C_G}═════════════════════
 echo -e "${C_G}  ГОТОВО. VLESS+Reality+Vision и AmneziaWG 2.0 развёрнуты ($NP клиентов).${C_N}"
 echo -e "${C_G}════════════════════════════════════════════════════════════════${C_N}"
 echo -e "\n${C_B}━━ Панель 3x-ui ━━${C_N}"
-echo -e "  URL:    https://$PUBIP:$PANEL_PORT$PANEL_PATH"
+echo -e "  URL:    https://$PANEL_HOST:$PANEL_PORT$PANEL_PATH"
 echo -e "  Логин:  $PANEL_USER"
 echo -e "  Пароль: $PANEL_PASS"
 echo -e "\n${C_B}━━ Ссылки для пересылки (перешли каждому ЕГО ссылку) ━━${C_N}"
 echo -e "  ${C_Y}одна ссылка = страница с настройкой Amnezia (AWG) + Hiddify/роутер (VLESS), с QR${C_N}"
-echo "$PEOPLE" | jq -r --arg ip "$PUBIP" --arg ap "$AGG_PORT" '.[]|"   • \(.name):  https://\($ip):\($ap)/p/\(.sub)"'
+echo "$PEOPLE" | jq -r --arg ip "$PANEL_HOST" --arg ap "$AGG_PORT" '.[]|"   • \(.name):  https://\($ip):\($ap)/p/\(.sub)"'
 echo -e "\n${C_Y}Все ссылки и доступы сохранены в памятке: $HANDOFF${C_N}"
 echo -e "${C_Y}Секреты: $SECRETS · Те же клиенты на другом сервере: запусти с CLIENTS_JSON из $SECRETS${C_N}\n"
