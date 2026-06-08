@@ -256,7 +256,6 @@ echo "$PEOPLE" | jq -r '.[].name' | while read -r nm; do
   # клиентский .conf (современный 2.0)
   { printf '[Interface]\nAddress = %s/32\nDNS = 1.1.1.1, 8.8.8.8\nPrivateKey = %s\n' "$cip" "$cpriv"; printf '%b\n' "$OBFS_CLI";
     printf '\n[Peer]\nPublicKey = %s\nPresharedKey = %s\nAllowedIPs = 0.0.0.0/0, ::/0\nEndpoint = %s:%s\nPersistentKeepalive = 25\n' "$AWG_SRV_PUB" "$psk" "$PUBIP" "$AWG_PORT"; } > "$AWGDIR/${nm}.conf"
-  qrencode -r "$AWGDIR/${nm}.conf" -s 10 -m 2 -o "$AWGQR/${nm}.png" 2>/dev/null || true
   idx=$((idx+1))
 done
 chmod 600 "$AWGCONF"
@@ -318,6 +317,31 @@ echo "$PEOPLE" | jq -r '.[]|"\(.name) \(.uuid)"' | while read -r nm uid; do
   link="vless://${uid}@${PUBIP}:${VLESS_PORT}?encryption=none&flow=xtls-rprx-vision&fp=chrome&pbk=${REALITY_PUBLIC_KEY}&security=reality&sid=${REALITY_SHORT_ID}&sni=${SNI_DONOR}&spx=%2F#${SRV_LABEL}-${nm}"
   printf '%s' "$link" > "$DIST/${nm}.vless"; qrencode -s 10 -m 2 -o "$DIST/${nm}-vless.png" "$link" 2>/dev/null || true
 done
+# AmneziaWG vpn:// ключи (родной формат Amnezia: container amnezia-awg2, protocol_version 2) + QR из них (сканируются приложением)
+AWG_SUBNET="$AWG_SUBNET" python3 - <<'PYAWG'
+import os,re,json,zlib,struct,base64,subprocess,glob
+CLd="/root/vpn-setup/awg/clients"; QRd="/root/vpn-setup/awg/qr"; DIST="/root/vpn-setup/dist"
+SUBNET=os.environ.get("AWG_SUBNET","10.9.7")+".0"
+def g(t,k):
+    m=re.search(r'^'+k+r'\s*=\s*(.+)$',t,re.M); return m.group(1).strip() if m else ""
+for f in glob.glob(CLd+"/*.conf"):
+    name=os.path.basename(f)[:-5]
+    t=open(f).read(); i=t.find("[Peer]"); ifc=t[:i]; peer=t[i:]
+    priv=g(ifc,"PrivateKey"); cip=g(ifc,"Address").split("/")[0]
+    P={k:g(ifc,k) for k in ("Jc","Jmin","Jmax","S1","S2","S3","S4","H1","H2","H3","H4","I1")}
+    spub=g(peer,"PublicKey"); psk=g(peer,"PresharedKey"); endp=g(peer,"Endpoint")
+    host=endp.split(":")[0]; port=endp.split(":")[1]
+    pub=subprocess.run(["awg","pubkey"],input=priv+"\n",capture_output=True,text=True).stdout.strip()
+    cfg=("[Interface]\nAddress = %s/32\nDNS = $PRIMARY_DNS, $SECONDARY_DNS\nPrivateKey = %s\nJc = %s\nJmin = %s\nJmax = %s\nS1 = %s\nS2 = %s\nS3 = %s\nS4 = %s\nH1 = %s\nH2 = %s\nH3 = %s\nH4 = %s\nI1 = %s\nI2 = \nI3 = \nI4 = \nI5 = \n\n[Peer]\nPublicKey = %s\nPresharedKey = %s\nAllowedIPs = 0.0.0.0/0, ::/0\nEndpoint = %s\nPersistentKeepalive = 25\n")%(cip,priv,P["Jc"],P["Jmin"],P["Jmax"],P["S1"],P["S2"],P["S3"],P["S4"],P["H1"],P["H2"],P["H3"],P["H4"],P["I1"],spub,psk,endp)
+    common={"H1":P["H1"],"H2":P["H2"],"H3":P["H3"],"H4":P["H4"],"I1":P["I1"],"I2":"","I3":"","I4":"","I5":"","Jc":P["Jc"],"Jmax":P["Jmax"],"Jmin":P["Jmin"],"S1":P["S1"],"S2":P["S2"],"S3":P["S3"],"S4":P["S4"]}
+    last=dict(common); last.update({"allowed_ips":["0.0.0.0/0","::/0"],"clientId":pub,"client_ip":cip,"client_priv_key":priv,"client_pub_key":pub,"config":cfg,"hostName":host,"mtu":"1376","persistent_keep_alive":"25","port":int(port),"psk_key":psk,"server_pub_key":spub})
+    awg=dict(common); awg.update({"last_config":json.dumps(last,indent=4),"port":str(port),"protocol_version":"2","subnet_address":SUBNET,"transport_proto":"udp"})
+    outer={"containers":[{"awg":awg,"container":"amnezia-awg2"}],"defaultContainer":"amnezia-awg2","description":name,"dns1":"1.1.1.1","dns2":"8.8.8.8","hostName":host}
+    raw=json.dumps(outer,ensure_ascii=False).encode()
+    key="vpn://"+base64.urlsafe_b64encode(struct.pack(">I",len(raw))+zlib.compress(raw,9)).decode().rstrip("=")
+    open(DIST+"/"+name+".vpn","w").write(key)
+    subprocess.run(["qrencode","-s","8","-m","2","-o",QRd+"/"+name+".png",key])
+PYAWG
 curl -fsSL "https://raw.githubusercontent.com/denis-ne-normis/server-init/${REPO_REF}/aggsub.py" -o /root/aggsub.py 2>/dev/null || cp "$WORKDIR/aggsub.py" /root/aggsub.py 2>/dev/null || true
 if [ ! -f /root/aggsub.py ]; then warn "aggsub.py не найден в репозитории — страницы /p будут недоступны (см. README)"; else
   cat > /etc/systemd/system/aggsub.service <<UNIT

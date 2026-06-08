@@ -31,6 +31,12 @@ def srvlabel():
     except Exception:
         return ""
 
+def vpnkey(name):
+    try:
+        return open("/root/vpn-setup/dist/" + name + ".vpn").read().strip()
+    except Exception:
+        return ""
+
 def ppage(name, sub):
     vless = ""
     try:
@@ -48,7 +54,7 @@ body{font-family:-apple-system,Roboto,Segoe UI,sans-serif;background:#0e1018;col
 .t1{background:#1f3a2a;color:#7fe0a0}.t2{background:#28304d;color:#9bb4ff}
 img.qr{width:300px;max-width:92vw;background:#fff;padding:10px;border-radius:12px;image-rendering:pixelated;image-rendering:crisp-edges}
 a.b{display:block;text-decoration:none;color:#fff;font-weight:600;padding:13px;border-radius:11px;margin:10px 0;font-size:16px}
-.g{background:#2f9e5b}textarea{width:100%%;height:64px;border-radius:9px;border:1px solid #2a2f4a;background:#0e1018;color:#8b90a8;font-size:10px;padding:7px;box-sizing:border-box}
+.g{background:#2f9e5b}.g2{background:#2a3550;font-size:14px;padding:11px}textarea{width:100%%;height:64px;border-radius:9px;border:1px solid #2a2f4a;background:#0e1018;color:#8b90a8;font-size:10px;padding:7px;box-sizing:border-box}
 button.c{background:#2a2f4a;color:#fff;border:0;border-radius:9px;padding:10px 16px;margin-top:6px;font-size:14px}
 ol{text-align:left;color:#c7cbe0;font-size:14px;line-height:1.55;padding-left:18px;margin:8px 0}
 .store{font-size:12px;color:#8b90a8;margin-top:8px}.store a{color:#9bb4ff;margin:0 5px}
@@ -56,10 +62,11 @@ ol{text-align:left;color:#c7cbe0;font-size:14px;line-height:1.55;padding-left:18
 <h1>VPN — %(n)s</h1><div class=muted>сервер <b>%(lbl)s</b> · твои личные конфиги, никому не пересылай</div>
 <div class=card><span class="tag t1">ОСНОВНОЙ</span><h2>Amnezia (AmneziaWG)</h2>
 <ol><li>Установи приложение <b>AmneziaVPN</b> (внизу ссылки).</li>
-<li>В приложении: «+» → «QR-код», отсканируй код ниже. Или «Файл с настройками» → кнопка «Скачать конфиг».</li>
+<li>Нажми <b>«Открыть в Amnezia»</b> — ключ импортируется сам. Или отсканируй QR в приложении («+» → «QR-код»). Или скачай файл.</li>
 <li>Нажми «Подключиться».</li></ol>
+<a class="b g" href="%(vpn)s">Открыть в Amnezia (1 тап)</a>
 %(aqr)s
-<a class="b g" href="/awg/%(sub)s" download>Скачать конфиг Amnezia</a>
+<a class="b g2" href="/awg/%(sub)s" download>Скачать файлом (запас)</a>
 <div class=store><a href="https://play.google.com/store/apps/details?id=org.amnezia.vpn">Android</a> · <a href="https://apps.apple.com/app/id1600529900">iPhone</a> · <a href="https://amnezia.org/downloads">ПК</a></div></div>
 <div class=card><span class="tag t2">РЕЗЕРВ / РОУТЕР</span><h2>Hiddify (VLESS Reality)</h2>
 <ol><li>Установи <b>Hiddify</b> (внизу), включи Xray-core в настройках.</li>
@@ -69,7 +76,7 @@ ol{text-align:left;color:#c7cbe0;font-size:14px;line-height:1.55;padding-left:18
 <textarea id=v readonly>%(vless)s</textarea>
 <button class=c onclick="navigator.clipboard.writeText(document.getElementById('v').value);this.textContent='Скопировано'">Скопировать VLESS</button>
 <div class=store><a href="https://play.google.com/store/apps/details?id=app.hiddify.com">Android</a> · <a href="https://apps.apple.com/app/id6596777532">iPhone</a> · <a href="https://hiddify.com/">ПК</a></div></div>
-</div></body></html>""" % {"n": e(name), "sub": e(sub), "vless": e(vless), "lbl": e(srvlabel() or "—"),
+</div></body></html>""" % {"n": e(name), "sub": e(sub), "vless": e(vless), "vpn": e(vpnkey(name)), "lbl": e(srvlabel() or "—"),
         "aqr": ('<img class=qr src="data:image/png;base64,%s">' % aqr) if aqr else "<i>нет QR</i>",
         "vqr": ('<img class=qr src="data:image/png;base64,%s">' % vqr) if vqr else "<i>нет QR</i>"}
 
