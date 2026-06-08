@@ -33,7 +33,7 @@ SUB_PORT="${SUB_PORT:-2096}"                   # порт подписки 3x-ui
 AGG_PORT="${AGG_PORT:-2087}"                   # порт раздачи (персональные страницы /p)
 BLOCK_SMTP="${BLOCK_SMTP:-1}"                  # 1 = блокировать исходящий SMTP
 CHECK_RUSSIA="${CHECK_RUSSIA:-1}"             # 1 = проверить доступность портов из РФ
-ENABLE_LE="${ENABLE_LE:-1}"                     # 1 = валидный сертификат через sslip.io + Let's Encrypt (без предупреждений)
+ENABLE_LE="${ENABLE_LE:-1}"                     # 1 = валидный Let's Encrypt сертификат прямо на IP (без предупреждений; нужен порт 80)
 FORCE_REINSTALL="${FORCE_REINSTALL:-0}"
 REPO_REF="${REPO_REF:-main}"                    # ветка/коммит репозитория для дозагрузки aggsub.py
 
@@ -180,18 +180,19 @@ ok "клиентов: $NP ($(echo "$PEOPLE" | jq -r '[.[].name]|join(", ")'))"
 step "Хардинг панели + HTTPS"
 XUI_DB="/etc/x-ui/x-ui.db"
 "$XUIBIN" setting -username "$PANEL_USER" -password "$PANEL_PASS" -port "$PANEL_PORT" -webBasePath "$PANEL_PATH_RAW" >>"$LOG" 2>&1
-# Валидный сертификат без своего домена: sslip.io (резолвит IP) + Let's Encrypt (acme.sh, standalone порт 80).
-LE_HOST="${PUBIP//./-}.sslip.io"; PANEL_HOST="$PUBIP"; PANEL_CERT=""; PANEL_KEY=""
-if [ "$ENABLE_LE" = "1" ] && getent hosts "$LE_HOST" >/dev/null 2>&1; then
-  [ -f /root/.acme.sh/acme.sh ] || curl -s https://get.acme.sh | sh -s email="admin@$LE_HOST" >>"$LOG" 2>&1
+# Валидный сертификат без своего домена: Let's Encrypt ПРЯМО НА IP (LE с 2025 умеет IP-сертификаты,
+# короткоживущие ~6 дней; acme.sh сам продлевает по крону). Нужен открытый порт 80.
+PANEL_HOST="$PUBIP"; PANEL_CERT=""; PANEL_KEY=""
+if [ "$ENABLE_LE" = "1" ]; then
+  [ -f /root/.acme.sh/acme.sh ] || curl -s https://get.acme.sh | sh -s email="admin@example.com" >>"$LOG" 2>&1
   ACME=/root/.acme.sh/acme.sh
   [ -f "$ACME" ] && "$ACME" --set-default-ca --server letsencrypt >>"$LOG" 2>&1 || true
-  if [ -f "$ACME" ] && { [ -d "/root/.acme.sh/${LE_HOST}_ecc" ] || "$ACME" --issue -d "$LE_HOST" --standalone --keylength ec-256 >>"$LOG" 2>&1; }; then
+  if [ -f "$ACME" ] && { [ -d "/root/.acme.sh/${PUBIP}_ecc" ] || "$ACME" --issue -d "$PUBIP" --standalone --keylength ec-256 >>"$LOG" 2>&1; }; then
     mkdir -p /root/cert/le
-    "$ACME" --install-cert -d "$LE_HOST" --ecc --fullchain-file /root/cert/le/fullchain.pem --key-file /root/cert/le/private.key \
+    "$ACME" --install-cert -d "$PUBIP" --ecc --fullchain-file /root/cert/le/fullchain.pem --key-file /root/cert/le/private.key \
       --reloadcmd "systemctl restart x-ui; systemctl restart aggsub 2>/dev/null || true" >>"$LOG" 2>&1
-    PANEL_CERT=/root/cert/le/fullchain.pem; PANEL_KEY=/root/cert/le/private.key; PANEL_HOST="$LE_HOST"
-    ok "Let's Encrypt сертификат для $LE_HOST — открывается без предупреждений"
+    PANEL_CERT=/root/cert/le/fullchain.pem; PANEL_KEY=/root/cert/le/private.key
+    ok "Let's Encrypt сертификат для IP $PUBIP — открывается по IP без предупреждений"
   else warn "LE не выпустился (порт 80 закрыт/занят?) — ставлю self-signed"; fi
 fi
 if [ -z "$PANEL_CERT" ]; then
