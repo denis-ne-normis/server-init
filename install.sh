@@ -1,36 +1,38 @@
 #!/usr/bin/env bash
 #
 # ════════════════════════════════════════════════════════════════════════════
-#  One-click VPN installer — 3x-ui + VLESS-XHTTP-Reality + Hysteria2
-#  Tested on a clean Ubuntu 24.04 / Debian 12 (amd64), root.
+#  One-click VPN installer — 3x-ui + двойной VLESS+Reality (XHTTP + TCP/Vision)
+#  Чистый Ubuntu 24.04 / Debian 12 (amd64), root.
 #
-#  Что делает (полностью, с нуля, идемпотентно):
+#  Делает с нуля, идемпотентно:
 #    • apt update/upgrade + зависимости
-#    • BBR + сетевой тюнинг (буферы TCP/UDP), синхронизация времени
-#    • ставит панель 3x-ui (фикс. версия = bundled Xray-core 26.6.1)
+#    • BBR + сетевой тюнинг, синхронизация времени
+#    • панель 3x-ui (фикс. версия = Xray-core 26.6.1)
 #    • хардинг: случайный путь/порт/логин/пароль, HTTPS (LE для IP или self-signed)
-#    • Inbound A: VLESS + XHTTP + Reality (TCP/443), fp=chrome, донор microsoft.com
-#    • Inbound B: Hysteria2 (UDP/443) + salamander-обфускация + port-hopping 20000-40000
+#    • Канал A: VLESS + XHTTP + Reality (TCP/443) — основной, стелс
+#    • Канал B: VLESS + Reality + TCP + Vision (TCP/8443) — резерв, максимальная
+#               совместимость (роутеры, старые клиенты); стабилен после рестартов
 #    • фаервол nftables (deny-by-default, SSH-safe, блок исходящего SMTP)
-#    • проверки работоспособности (в т.ч. реальный прогон трафика через прокси)
-#    • выдаёт в консоль доступ к панели + готовые ссылки/QR (первый клиент уже создан)
+#    • самопроверка: реальный прогон трафика через ОБА канала
+#    • выдаёт в консоль доступ к панели + готовые ссылки/QR (первый клиент создан)
 #
-#  Запуск:  bash <(curl -fsSL https://raw.githubusercontent.com/<you>/<repo>/main/install.sh)
+#  Почему не Hysteria2: встроенный в Xray hy2-inbound нестабилен (баг #5921 —
+#  перестаёт отвечать после рестарта Xray). Два VLESS+Reality канала на разных
+#  транспортах/портах дают надёжное резервирование без этого бага.
+#
+#  Запуск:  bash <(curl -fsSL https://raw.githubusercontent.com/denis-ne-normis/server-init/main/install.sh)
 #  Повторный запуск безопасен (переиспользует ранее сгенерированные секреты).
 # ════════════════════════════════════════════════════════════════════════════
 set -Eeuo pipefail
 
 # ───────────────────────────── CONFIG (можно править) ──────────────────────────
-XUI_VERSION="${XUI_VERSION:-v3.2.8}"          # пин панели (=> Xray-core 26.6.1, hy2-inbound + XHTTP). "" = latest
+XUI_VERSION="${XUI_VERSION:-v3.2.8}"          # пин панели (=> Xray-core 26.6.1). "" = latest
 SNI_DONOR="${SNI_DONOR:-www.microsoft.com}"   # донор Reality (TLS1.3+H2+X25519, глобальный CDN, без RU PoP)
-VLESS_PORT="${VLESS_PORT:-443}"               # порт VLESS+Reality (TCP)
-HY2_PORT="${HY2_PORT:-443}"                    # базовый порт Hysteria2 (UDP)
-HOP_START="${HOP_START:-20000}"               # начало диапазона port-hopping (UDP)
-HOP_END="${HOP_END:-40000}"                    # конец диапазона port-hopping (UDP)
+VLESS_PORT="${VLESS_PORT:-443}"               # Канал A: VLESS+XHTTP+Reality (TCP)
+VISION_PORT="${VISION_PORT:-8443}"            # Канал B: VLESS+Reality+TCP+Vision
 PANEL_PORT="${PANEL_PORT:-}"                    # порт панели; пусто => случайный
-MASQ_URL="${MASQ_URL:-https://www.bing.com/}"  # маскировка Hysteria2 при HTTP-зондировании
-FIRST_CLIENT="${FIRST_CLIENT:-client-1}"       # имя первого клиента (уже создаётся)
-ENABLE_HYSTERIA2="${ENABLE_HYSTERIA2:-1}"      # 1 = поднять резервный Hysteria2
+FIRST_CLIENT="${FIRST_CLIENT:-client-1}"       # имя первого клиента (создаётся в обоих каналах)
+ENABLE_BACKUP="${ENABLE_BACKUP:-1}"            # 1 = поднять резервный канал B (Vision)
 BLOCK_SMTP="${BLOCK_SMTP:-1}"                   # 1 = блокировать исходящий SMTP (анти-абуз)
 FORCE_REINSTALL="${FORCE_REINSTALL:-0}"        # 1 = переустановить панель, даже если уже стоит
 
@@ -38,7 +40,7 @@ WORKDIR="/root/vpn-setup"
 SECRETS="$WORKDIR/secrets.env"
 HANDOFF="/root/vpn-handoff.md"
 LOG="/var/log/vpn-install.log"
-XRAY_FLOOR_MAJOR=26                             # Xray-core >= 26.3.27 нужен для Hysteria2-inbound
+XRAY_FLOOR_MAJOR=26
 INSTALL_SH="https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh"
 # ────────────────────────────────────────────────────────────────────────────────
 
@@ -61,8 +63,6 @@ step "Pre-flight"
 case "${ID:-}" in ubuntu|debian) ok "ОС: $PRETTY_NAME" ;; *) warn "ОС $PRETTY_NAME не тестировалась (ожидается Ubuntu/Debian)";; esac
 [ "$(uname -m)" = "x86_64" ] || die "нужен amd64 (x86_64), у вас $(uname -m)"
 export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a
-WAN_IF="$(ip -4 route get 1.1.1.1 2>/dev/null | grep -oP 'dev \K\S+' | head -1)"; [ -n "$WAN_IF" ] || die "не определил WAN-интерфейс"
-ok "WAN-интерфейс: $WAN_IF"
 
 # ───────────────────────────── 1. Зависимости ─────────────────────────────
 step "Установка зависимостей"
@@ -72,7 +72,6 @@ apt-get install -y curl wget jq qrencode openssl ca-certificates nftables socat 
 for c in curl jq qrencode openssl nft; do require "$c"; done
 ok "зависимости установлены"
 
-# публичный IP (до фаервола, исходящий открыт)
 PUBIP="$(curl -fsS4 --max-time 10 https://api.ipify.org 2>/dev/null || true)"
 [ -n "$PUBIP" ] || PUBIP="$(ip -4 route get 1.1.1.1 2>/dev/null | grep -oP 'src \K\S+' | head -1)"
 [ -n "$PUBIP" ] || die "не определил публичный IP"
@@ -121,9 +120,9 @@ XUIBIN=/usr/local/x-ui/x-ui
 XRAYBIN="$(ls /usr/local/x-ui/bin/xray-linux-* 2>/dev/null | head -1)"; [ -x "$XRAYBIN" ] || die "не нашёл бинарь xray"
 XRAY_VER="$("$XRAYBIN" -version 2>/dev/null | grep -oP 'Xray \K[0-9.]+' | head -1)"
 ok "Xray-core: $XRAY_VER"
-[ "${XRAY_VER%%.*}" -ge "$XRAY_FLOOR_MAJOR" ] 2>/dev/null || warn "Xray-core < $XRAY_FLOOR_MAJOR.x — Hysteria2-inbound может не поддерживаться"
+[ "${XRAY_VER%%.*}" -ge "$XRAY_FLOOR_MAJOR" ] 2>/dev/null || warn "Xray-core < $XRAY_FLOOR_MAJOR.x — возможны проблемы с XHTTP"
 
-# ───────────────────────────── 4. Секреты (генерация или переиспользование) ─────────────────────────────
+# ───────────────────────────── 4. Секреты ─────────────────────────────
 step "Секреты"
 gen_alnum() { local s; s="$(openssl rand -base64 "$1" | tr -dc 'A-Za-z0-9')"; printf '%s' "${s:0:$2}"; }
 if [ -f "$SECRETS" ]; then
@@ -135,7 +134,6 @@ PANEL_USER="${PANEL_USER:-admin_$(gen_alnum 12 8)}"
 PANEL_PASS="${PANEL_PASS:-$(gen_alnum 48 32)}"
 PANEL_PATH_RAW="${PANEL_PATH_RAW:-$(gen_alnum 36 18)}"
 [ -n "${PANEL_PORT:-}" ] || PANEL_PORT="$(shuf -i 20000-60000 -n1)"
-# Reality
 if [ -z "${REALITY_PRIVATE_KEY:-}" ] || [ -z "${REALITY_PUBLIC_KEY:-}" ]; then
   KP="$("$XRAYBIN" x25519)"
   REALITY_PRIVATE_KEY="$(echo "$KP" | grep -iE 'private' | awk -F: '{print $2}' | tr -d ' ')"
@@ -144,17 +142,11 @@ fi
 REALITY_SHORT_ID="${REALITY_SHORT_ID:-$(openssl rand -hex 8)}"
 VLESS_UUID="${VLESS_UUID:-$("$XRAYBIN" uuid)}"
 VLESS_PATH="${VLESS_PATH:-/api/v1/$(openssl rand -hex 4)}"
-# Hysteria2
-HY2_AUTH_PASSWORD="${HY2_AUTH_PASSWORD:-$(gen_alnum 36 28)}"
-HY2_OBFS_PASSWORD="${HY2_OBFS_PASSWORD:-$(gen_alnum 36 28)}"
-HY2_CERT="${HY2_CERT:-/root/cert/hy2/cert.crt}"
-HY2_KEY="${HY2_KEY:-/root/cert/hy2/private.key}"
 ok "секреты готовы"
 
 # ───────────────────────────── 5. Хардинг панели ─────────────────────────────
 step "Хардинг панели (путь/порт/логин/пароль/HTTPS)"
 "$XUIBIN" setting -username "$PANEL_USER" -password "$PANEL_PASS" -port "$PANEL_PORT" -webBasePath "$PANEL_PATH_RAW" >>"$LOG" 2>&1
-# Сертификат панели: оставляем LE-для-IP если установщик его выдал, иначе self-signed
 CERT_LINE="$("$XUIBIN" setting -getCert 2>/dev/null || true)"
 PANEL_CERT="$(echo "$CERT_LINE" | grep -i 'cert:' | awk '{print $2}')"
 PANEL_KEY="$(echo  "$CERT_LINE" | grep -i 'key:'  | awk '{print $2}')"
@@ -171,10 +163,9 @@ else
 fi
 systemctl enable x-ui >>"$LOG" 2>&1 || true
 systemctl restart x-ui
-# нормализованные значения и ожидание панели
 sleep 2
 PANEL_PORT="$("$XUIBIN" setting -show 2>/dev/null | grep -i '^port' | awk '{print $2}')"
-PANEL_PATH="$("$XUIBIN" setting -show 2>/dev/null | grep -i 'webBasePath' | awk '{print $2}')"   # вид: /xxx/
+PANEL_PATH="$("$XUIBIN" setting -show 2>/dev/null | grep -i 'webBasePath' | awk '{print $2}')"
 [ -n "$PANEL_PORT" ] && [ -n "$PANEL_PATH" ] || die "не прочитал настройки панели"
 BASE="https://127.0.0.1:${PANEL_PORT}${PANEL_PATH%/}"
 for i in $(seq 1 20); do
@@ -199,70 +190,53 @@ step "Авторизация в панели (API)"
 api_login || die "не удалось залогиниться в панель API"
 ok "API-сессия установлена"
 
-# ───────────────────────────── 7. Inbound A: VLESS+XHTTP+Reality ─────────────────────────────
-step "Inbound A — VLESS + XHTTP + Reality (TCP/$VLESS_PORT)"
+# общий realitySettings для обоих каналов
+REALITY_JSON="$(jq -cn --arg priv "$REALITY_PRIVATE_KEY" --arg pub "$REALITY_PUBLIC_KEY" --arg sid "$REALITY_SHORT_ID" --arg donor "$SNI_DONOR" \
+  '{show:false,dest:($donor+":443"),xver:0,serverNames:[$donor],privateKey:$priv,shortIds:["",$sid],settings:{publicKey:$pub,fingerprint:"chrome",spiderX:"/"}}')"
+
+# ───────────────────────────── 7. Канал A: VLESS+XHTTP+Reality ─────────────────────────────
+step "Канал A — VLESS + XHTTP + Reality (TCP/$VLESS_PORT)"
 echo Q | openssl s_client -connect "${SNI_DONOR}:443" -servername "$SNI_DONOR" -alpn h2 2>/dev/null \
   | grep -q 'Verify return code: 0' && ok "донор $SNI_DONOR валиден (TLS ok)" || warn "донор $SNI_DONOR не прошёл быстрый TLS-чек"
 if inbound_exists "VLESS-XHTTP-Reality"; then
-  ok "inbound VLESS-XHTTP-Reality уже есть — пропускаю"
+  ok "канал A уже есть — пропускаю"
 else
   S=$(jq -cn --arg id "$VLESS_UUID" --arg em "$FIRST_CLIENT" '{clients:[{id:$id,flow:"",email:$em,enable:true,limitIp:0,totalGB:0,expiryTime:0,tgId:"",subId:"sub1"}],decryption:"none",fallbacks:[]}')
-  ST=$(jq -cn --arg path "$VLESS_PATH" --arg priv "$REALITY_PRIVATE_KEY" --arg pub "$REALITY_PUBLIC_KEY" --arg sid "$REALITY_SHORT_ID" --arg donor "$SNI_DONOR" \
-    '{network:"xhttp",security:"reality",xhttpSettings:{host:"",path:$path,mode:"auto"},
-      realitySettings:{show:false,dest:($donor+":443"),xver:0,serverNames:[$donor],privateKey:$priv,shortIds:["",$sid],settings:{publicKey:$pub,fingerprint:"chrome",spiderX:"/"}}}')
+  ST=$(jq -cn --arg path "$VLESS_PATH" --argjson reality "$REALITY_JSON" \
+    '{network:"xhttp",security:"reality",xhttpSettings:{host:"",path:$path,mode:"auto"},realitySettings:$reality}')
   SN=$(jq -cn '{enabled:true,destOverride:["http","tls","quic"],metadataOnly:false,routeOnly:false}')
   BODY=$(jq -cn --arg s "$S" --arg st "$ST" --arg sn "$SN" --argjson port "$VLESS_PORT" \
     '{enable:true,remark:"VLESS-XHTTP-Reality",listen:"",port:$port,protocol:"vless",expiryTime:0,settings:$s,streamSettings:$st,sniffing:$sn}')
-  R=$(api_post "/panel/api/inbounds/add" "$BODY"); echo "$R" | jq -e '.success==true' >/dev/null || die "не добавился VLESS inbound: $(echo "$R" | jq -r '.msg // .')"
-  ok "VLESS+XHTTP+Reality создан (клиент: $FIRST_CLIENT)"
+  R=$(api_post "/panel/api/inbounds/add" "$BODY"); echo "$R" | jq -e '.success==true' >/dev/null || die "канал A не создан: $(echo "$R" | jq -r '.msg // .')"
+  ok "канал A создан (клиент: $FIRST_CLIENT)"
 fi
 
-# ───────────────────────────── 8. Inbound B: Hysteria2 ─────────────────────────────
-if [ "$ENABLE_HYSTERIA2" = "1" ]; then
-  step "Inbound B — Hysteria2 (UDP/$HY2_PORT) + salamander + port-hopping"
-  if [ ! -f "$HY2_CERT" ]; then
-    mkdir -p "$(dirname "$HY2_CERT")"
-    openssl req -x509 -nodes -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -days 3650 \
-      -keyout "$HY2_KEY" -out "$HY2_CERT" -subj "/CN=$PUBIP" -addext "subjectAltName=IP:$PUBIP" >>"$LOG" 2>&1
-    ok "self-signed сертификат Hysteria2 создан"
-  fi
-  HY2_CERT_PIN_SHA256="$(openssl x509 -in "$HY2_CERT" -noout -fingerprint -sha256 | sed 's/.*=//;s/://g')"
-  if inbound_exists "Hysteria2"; then
-    ok "inbound Hysteria2 уже есть — пропускаю"
+# ───────────────────────────── 8. Канал B: VLESS+Reality+TCP+Vision ─────────────────────────────
+if [ "$ENABLE_BACKUP" = "1" ]; then
+  step "Канал B — VLESS + Reality + TCP + Vision (TCP/$VISION_PORT) — надёжный резерв"
+  if inbound_exists "VLESS-TCP-Reality-Vision"; then
+    ok "канал B уже есть — пропускаю"
   else
-    S=$(jq -cn --arg auth "$HY2_AUTH_PASSWORD" --arg em "$FIRST_CLIENT" '{version:2,clients:[{auth:$auth,email:$em}]}')
-    ST=$(jq -cn --arg cert "$HY2_CERT" --arg key "$HY2_KEY" --arg obfs "$HY2_OBFS_PASSWORD" --arg ip "$PUBIP" --arg masq "$MASQ_URL" \
-      '{network:"hysteria",security:"tls",tlsSettings:{serverName:$ip,certificates:[{certificateFile:$cert,keyFile:$key}]},
-        hysteriaSettings:{version:2,masquerade:{type:"proxy",url:$masq,rewriteHost:true}},
-        finalmask:{udp:[{type:"salamander",settings:{password:$obfs}}],quicParams:{congestion:"bbr"}}}')
-    SN=$(jq -cn '{enabled:false,destOverride:["http","tls","quic"],metadataOnly:false,routeOnly:false}')
-    BODY=$(jq -cn --arg s "$S" --arg st "$ST" --arg sn "$SN" --argjson port "$HY2_PORT" \
-      '{enable:true,remark:"Hysteria2",listen:"0.0.0.0",port:$port,protocol:"hysteria",expiryTime:0,settings:$s,streamSettings:$st,sniffing:$sn}')
-    R=$(api_post "/panel/api/inbounds/add" "$BODY"); echo "$R" | jq -e '.success==true' >/dev/null || die "не добавился Hysteria2 inbound: $(echo "$R" | jq -r '.msg // .')"
-    ok "Hysteria2 создан (salamander-обфускация активна)"
+    S=$(jq -cn --arg id "$VLESS_UUID" --arg em "$FIRST_CLIENT" '{clients:[{id:$id,flow:"xtls-rprx-vision",email:($em+"-tcp"),enable:true,limitIp:0,totalGB:0,expiryTime:0,tgId:"",subId:"sub1tcp"}],decryption:"none",fallbacks:[]}')
+    ST=$(jq -cn --argjson reality "$REALITY_JSON" \
+      '{network:"tcp",security:"reality",realitySettings:$reality,tcpSettings:{acceptProxyProtocol:false,header:{type:"none"}}}')
+    SN=$(jq -cn '{enabled:true,destOverride:["http","tls","quic"],metadataOnly:false,routeOnly:false}')
+    BODY=$(jq -cn --arg s "$S" --arg st "$ST" --arg sn "$SN" --argjson port "$VISION_PORT" \
+      '{enable:true,remark:"VLESS-TCP-Reality-Vision",listen:"",port:$port,protocol:"vless",expiryTime:0,settings:$s,streamSettings:$st,sniffing:$sn}')
+    R=$(api_post "/panel/api/inbounds/add" "$BODY"); echo "$R" | jq -e '.success==true' >/dev/null || die "канал B не создан: $(echo "$R" | jq -r '.msg // .')"
+    ok "канал B создан (тот же клиент, flow=vision)"
   fi
 else
-  warn "Hysteria2 отключён (ENABLE_HYSTERIA2=0)"
+  warn "резервный канал B отключён (ENABLE_BACKUP=0)"
 fi
 
 # ───────────────────────────── 9. Фаервол (nftables) ─────────────────────────────
 step "Фаервол nftables (deny-by-default, SSH-safe)"
 SMTP_RULE=""; [ "$BLOCK_SMTP" = "1" ] && SMTP_RULE='tcp dport { 25, 465, 587 } reject with icmp type admin-prohibited'
-HY2_FW=""; NAT_TABLE=""
-if [ "$ENABLE_HYSTERIA2" = "1" ]; then
-  HY2_FW="udp dport $HY2_PORT counter accept
-        udp dport $HOP_START-$HOP_END accept"
-  NAT_TABLE="table inet nat {
-    chain prerouting {
-        type nat hook prerouting priority dstnat; policy accept;
-        iifname \"$WAN_IF\" udp dport $HOP_START-$HOP_END counter redirect to :$HY2_PORT
-    }
-}"
-fi
+BACKUP_RULE=""; [ "$ENABLE_BACKUP" = "1" ] && BACKUP_RULE="tcp dport $VISION_PORT accept"
 cat > /etc/nftables.conf <<NFT
 #!/usr/sbin/nft -f
 flush ruleset
-
 table inet filter {
     chain input {
         type filter hook input priority filter; policy drop;
@@ -274,7 +248,7 @@ table inet filter {
         tcp dport 22 accept
         tcp dport $PANEL_PORT accept
         tcp dport $VLESS_PORT accept
-        $HY2_FW
+        $BACKUP_RULE
     }
     chain forward { type filter hook forward priority filter; policy drop; }
     chain output {
@@ -282,44 +256,48 @@ table inet filter {
         $SMTP_RULE
     }
 }
-$NAT_TABLE
 NFT
 nft -c -f /etc/nftables.conf >>"$LOG" 2>&1 || die "ошибка синтаксиса nftables"
-# страховка от блокировки SSH: авто-сброс через 90с, снимется после успешной проверки
 nohup bash -c 'sleep 90; nft flush ruleset' >/dev/null 2>&1 &
 RB=$!
 nft -f /etc/nftables.conf
 systemctl enable nftables >>"$LOG" 2>&1 || true
-kill "$RB" 2>/dev/null || true   # правила корректны (ct established сохраняет текущую SSH-сессию) -> снимаем страховку
+kill "$RB" 2>/dev/null || true
 ok "фаервол применён и включён в автозагрузку"
 
-# ───────────────────────────── 10. Проверки работоспособности ─────────────────────────────
+# ───────────────────────────── 10. Проверки ─────────────────────────────
 step "Проверки работоспособности"
 systemctl is-active --quiet x-ui && ok "сервис x-ui активен" || die "x-ui не активен"
-ss -tlnp | grep -q ":$VLESS_PORT " && ok "TCP :$VLESS_PORT слушается (VLESS)" || die "нет TCP :$VLESS_PORT"
-if [ "$ENABLE_HYSTERIA2" = "1" ]; then ss -ulnp | grep -q ":$HY2_PORT " && ok "UDP :$HY2_PORT слушается (Hysteria2)" || warn "нет UDP :$HY2_PORT"; fi
-# Reality анти-зондирование: чужой клиент должен увидеть настоящий ответ донора
+ss -tlnp | grep -q ":$VLESS_PORT " && ok "TCP :$VLESS_PORT слушается (канал A)" || die "нет TCP :$VLESS_PORT"
+[ "$ENABLE_BACKUP" = "1" ] && { ss -tlnp | grep -q ":$VISION_PORT " && ok "TCP :$VISION_PORT слушается (канал B)" || warn "нет TCP :$VISION_PORT"; }
 if curl -s --max-time 12 --resolve "$SNI_DONOR:443:$PUBIP" "https://$SNI_DONOR/" -o /dev/null -w '%{http_code}' 2>/dev/null | grep -qE '^[23]'; then
   ok "Reality маскировка работает (зонд видит настоящий $SNI_DONOR)"
 else warn "быстрый Reality-зонд не подтвердился (не критично)"; fi
-# Реальный прогон трафика через прокси (Xray как клиент -> наш VLESS -> интернет)
-TCFG="$WORKDIR/.selftest.json"
-jq -n --arg uuid "$VLESS_UUID" --arg path "$VLESS_PATH" --arg pub "$REALITY_PUBLIC_KEY" --arg sid "$REALITY_SHORT_ID" --arg donor "$SNI_DONOR" --arg ip "$PUBIP" --argjson port "$VLESS_PORT" '
-{log:{loglevel:"error"},inbounds:[{tag:"s",listen:"127.0.0.1",port:10999,protocol:"socks",settings:{udp:true}}],
- outbounds:[{protocol:"vless",settings:{vnext:[{address:$ip,port:$port,users:[{id:$uuid,encryption:"none",flow:""}]}]},
-  streamSettings:{network:"xhttp",security:"reality",xhttpSettings:{host:"",path:$path,mode:"auto"},realitySettings:{serverName:$donor,publicKey:$pub,shortId:$sid,fingerprint:"chrome",spiderX:"/"}}}]}' > "$TCFG"
-"$XRAYBIN" run -c "$TCFG" >/dev/null 2>&1 & SPID=$!; sleep 5
-GOT="$(curl -s --max-time 15 --socks5-hostname 127.0.0.1:10999 https://api.ipify.org 2>/dev/null || true)"
-kill "$SPID" 2>/dev/null || true; wait "$SPID" 2>/dev/null || true; rm -f "$TCFG"
-[ "$GOT" = "$PUBIP" ] && ok "сквозной тест VLESS пройден (трафик вышел через сервер: $GOT)" || warn "сквозной тест вернул: '${GOT:-пусто}' (проверьте вручную)"
+# сквозной прогон через каналы
+selftest() { # $1=label $2=port $3=flow $4=network $5=extra(xhttp path or empty)
+  local cfg="$WORKDIR/.st.json"
+  if [ "$4" = "xhttp" ]; then
+    jq -n --arg u "$VLESS_UUID" --arg path "$VLESS_PATH" --arg pub "$REALITY_PUBLIC_KEY" --arg sid "$REALITY_SHORT_ID" --arg d "$SNI_DONOR" --argjson p "$2" \
+      '{log:{loglevel:"error"},inbounds:[{tag:"s",listen:"127.0.0.1",port:10991,protocol:"socks",settings:{udp:true}}],outbounds:[{protocol:"vless",settings:{vnext:[{address:"'"$PUBIP"'",port:$p,users:[{id:$u,encryption:"none",flow:""}]}]},streamSettings:{network:"xhttp",security:"reality",xhttpSettings:{host:"",path:$path,mode:"auto"},realitySettings:{serverName:$d,publicKey:$pub,shortId:$sid,fingerprint:"chrome",spiderX:"/"}}}]}' > "$cfg"
+  else
+    jq -n --arg u "$VLESS_UUID" --arg pub "$REALITY_PUBLIC_KEY" --arg sid "$REALITY_SHORT_ID" --arg d "$SNI_DONOR" --argjson p "$2" \
+      '{log:{loglevel:"error"},inbounds:[{tag:"s",listen:"127.0.0.1",port:10991,protocol:"socks",settings:{udp:true}}],outbounds:[{protocol:"vless",settings:{vnext:[{address:"'"$PUBIP"'",port:$p,users:[{id:$u,encryption:"none",flow:"xtls-rprx-vision"}]}]},streamSettings:{network:"tcp",security:"reality",realitySettings:{serverName:$d,publicKey:$pub,shortId:$sid,fingerprint:"chrome",spiderX:"/"}}}]}' > "$cfg"
+  fi
+  "$XRAYBIN" run -c "$cfg" >/dev/null 2>&1 & local p=$!; sleep 5
+  local got; got="$(curl -s --max-time 15 --socks5-hostname 127.0.0.1:10991 https://api.ipify.org 2>/dev/null || true)"
+  kill "$p" 2>/dev/null || true; wait "$p" 2>/dev/null || true; rm -f "$cfg"
+  [ "$got" = "$PUBIP" ] && ok "сквозной тест [$1] пройден (трафик вышел через сервер)" || warn "сквозной тест [$1] вернул: '${got:-пусто}'"
+}
+selftest "Канал A XHTTP/$VLESS_PORT" "$VLESS_PORT" "" "xhttp"
+[ "$ENABLE_BACKUP" = "1" ] && selftest "Канал B Vision/$VISION_PORT" "$VISION_PORT" "vision" "tcp"
 
 # ───────────────────────────── 11. Ссылки, QR, секреты, handoff ─────────────────────────────
 step "Генерация ссылок, QR и памятки"
 PANEL_URL="https://$PUBIP:$PANEL_PORT$PANEL_PATH"
 PATH_ENC="$(jq -rn --arg v "$VLESS_PATH" '$v|@uri')"
-VLESS_LINK="vless://${VLESS_UUID}@${PUBIP}:${VLESS_PORT}?type=xhttp&path=${PATH_ENC}&mode=auto&security=reality&encryption=none&pbk=${REALITY_PUBLIC_KEY}&fp=chrome&sni=${SNI_DONOR}&sid=${REALITY_SHORT_ID}&spx=%2F#${FIRST_CLIENT}-VLESS"
-HY2_LINK=""
-[ "$ENABLE_HYSTERIA2" = "1" ] && HY2_LINK="hysteria2://${HY2_AUTH_PASSWORD}@${PUBIP}:${HY2_PORT}?obfs=salamander&obfs-password=${HY2_OBFS_PASSWORD}&sni=${PUBIP}&insecure=1&mport=${HOP_START}-${HOP_END}#${FIRST_CLIENT}-HY2"
+LINK_A="vless://${VLESS_UUID}@${PUBIP}:${VLESS_PORT}?type=xhttp&path=${PATH_ENC}&mode=auto&security=reality&encryption=none&pbk=${REALITY_PUBLIC_KEY}&fp=chrome&sni=${SNI_DONOR}&sid=${REALITY_SHORT_ID}&spx=%2F#${FIRST_CLIENT}-XHTTP"
+LINK_B=""
+[ "$ENABLE_BACKUP" = "1" ] && LINK_B="vless://${VLESS_UUID}@${PUBIP}:${VISION_PORT}?type=tcp&security=reality&encryption=none&flow=xtls-rprx-vision&pbk=${REALITY_PUBLIC_KEY}&fp=chrome&sni=${SNI_DONOR}&sid=${REALITY_SHORT_ID}&spx=%2F#${FIRST_CLIENT}-Vision"
 
 umask 077
 cat > "$SECRETS" <<EOF
@@ -329,7 +307,7 @@ PANEL_PATH=$PANEL_PATH
 PANEL_PATH_RAW=$PANEL_PATH_RAW
 PANEL_USER=$PANEL_USER
 PANEL_PASS=$PANEL_PASS
-# ===== VLESS+XHTTP+Reality =====
+# ===== Reality (общий для обоих каналов) =====
 SNI_DONOR=$SNI_DONOR
 REALITY_PRIVATE_KEY=$REALITY_PRIVATE_KEY
 REALITY_PUBLIC_KEY=$REALITY_PUBLIC_KEY
@@ -337,19 +315,12 @@ REALITY_SHORT_ID=$REALITY_SHORT_ID
 VLESS_UUID=$VLESS_UUID
 VLESS_PATH=$VLESS_PATH
 VLESS_PORT=$VLESS_PORT
-# ===== Hysteria2 =====
-HY2_PORT=$HY2_PORT
-HY2_AUTH_PASSWORD=${HY2_AUTH_PASSWORD:-}
-HY2_OBFS_PASSWORD=${HY2_OBFS_PASSWORD:-}
-HY2_CERT=$HY2_CERT
-HY2_KEY=$HY2_KEY
-HY2_CERT_PIN_SHA256=${HY2_CERT_PIN_SHA256:-}
-HOP_RANGE=$HOP_START-$HOP_END
-VLESS_LINK='$VLESS_LINK'
-HY2_LINK='$HY2_LINK'
+VISION_PORT=$VISION_PORT
+LINK_A='$LINK_A'
+LINK_B='$LINK_B'
 EOF
-qrencode -o "$WORKDIR/vless_qr.png" -s 6 -m 2 "$VLESS_LINK" 2>/dev/null || true
-[ -n "$HY2_LINK" ] && qrencode -o "$WORKDIR/hy2_qr.png" -s 6 -m 2 "$HY2_LINK" 2>/dev/null || true
+qrencode -o "$WORKDIR/channelA_qr.png" -s 6 -m 2 "$LINK_A" 2>/dev/null || true
+[ -n "$LINK_B" ] && qrencode -o "$WORKDIR/channelB_qr.png" -s 6 -m 2 "$LINK_B" 2>/dev/null || true
 
 cat > "$HANDOFF" <<EOF
 # VPN handoff ($PUBIP)
@@ -359,28 +330,28 @@ cat > "$HANDOFF" <<EOF
 Пароль:  $PANEL_PASS
 Xray-core: $XRAY_VER · 3x-ui: $XUI_VERSION · донор: $SNI_DONOR
 
-## VLESS+XHTTP+Reality (основной)
-$VLESS_LINK
+## Канал A — VLESS+XHTTP+Reality (основной, TCP/$VLESS_PORT)
+$LINK_A
 
-## Hysteria2 (резерв, obfs=salamander, hop $HOP_START-$HOP_END, insecure)
-$HY2_LINK
+## Канал B — VLESS+Reality+TCP+Vision (резерв, TCP/$VISION_PORT)
+$LINK_B
 
-Требования к клиенту: ядро Xray >= 26.x; fp=chrome обязателен; для Hysteria2 — тот же obfs-пароль и insecure (или pinnedPeerCertSha256=${HY2_CERT_PIN_SHA256:-}).
+Требования к клиенту: ядро Xray >= 26.x; fp=chrome обязателен (уже в ссылках).
+Резервный канал B (Vision) совместим почти со всеми клиентами/роутерами.
 Все секреты: $SECRETS  · QR: $WORKDIR/*.png
 EOF
 chmod 600 "$SECRETS" "$HANDOFF"
 ok "сохранено: $HANDOFF и $SECRETS"
 
-# ───────────────────────────── 12. Итог в консоль ─────────────────────────────
+# ───────────────────────────── 12. Итог ─────────────────────────────
 echo -e "\n${C_G}════════════════════════════════════════════════════════════════${C_N}"
-echo -e "${C_G}  ГОТОВО. VPN развёрнут и проверен.${C_N}"
+echo -e "${C_G}  ГОТОВО. VPN развёрнут и проверен (2 канала VLESS+Reality).${C_N}"
 echo -e "${C_G}════════════════════════════════════════════════════════════════${C_N}"
 echo -e "${C_B}Панель:${C_N}  $PANEL_URL"
 echo -e "${C_B}Логин:${C_N}   $PANEL_USER"
 echo -e "${C_B}Пароль:${C_N}  $PANEL_PASS"
-echo -e "\n${C_B}VLESS (основной) — вставьте в Hiddify/v2rayNG/NekoBox:${C_N}\n$VLESS_LINK"
-[ -n "$HY2_LINK" ] && echo -e "\n${C_B}Hysteria2 (резерв):${C_N}\n$HY2_LINK"
-echo -e "\n${C_B}QR основного канала (отсканируйте телефоном):${C_N}"
-qrencode -t ANSIUTF8 "$VLESS_LINK"
-echo -e "${C_Y}Памятка со всеми данными: $HANDOFF${C_N}"
-echo -e "${C_Y}Версии: Xray-core $XRAY_VER · 3x-ui $XUI_VERSION · донор $SNI_DONOR${C_N}\n"
+echo -e "\n${C_B}Канал A (основной, XHTTP/$VLESS_PORT):${C_N}\n$LINK_A"
+[ -n "$LINK_B" ] && echo -e "\n${C_B}Канал B (резерв, Vision/$VISION_PORT):${C_N}\n$LINK_B"
+echo -e "\n${C_B}QR основного канала:${C_N}"
+qrencode -t ANSIUTF8 "$LINK_A"
+echo -e "${C_Y}Памятка: $HANDOFF · Версии: Xray $XRAY_VER · 3x-ui $XUI_VERSION${C_N}\n"
