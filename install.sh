@@ -24,6 +24,7 @@ set -Eeuo pipefail
 XUI_VERSION="${XUI_VERSION:-v3.2.8}"          # пин панели (=> Xray-core 26.6.1). "" = latest
 SNI_DONOR="${SNI_DONOR:-}"                     # донор Reality; пусто => спросит интерактивно
 VLESS_PORT="${VLESS_PORT:-}"                   # порт VLESS; пусто => спросит интерактивно
+SRV_LABEL="${SRV_LABEL:-}"                      # метка сервера (префикс в именах конфигов); пусто => спросит
 PANEL_PORT="${PANEL_PORT:-}"                   # порт панели; пусто => случайный
 CLIENTS="${CLIENTS:-denis vlad liza parents router svyt}"  # имена клиентов (без vless-main)
 AWG_PORT="${AWG_PORT:-39743}"                  # UDP-порт AmneziaWG
@@ -33,6 +34,7 @@ AGG_PORT="${AGG_PORT:-2087}"                   # порт раздачи (пер
 BLOCK_SMTP="${BLOCK_SMTP:-1}"                  # 1 = блокировать исходящий SMTP
 CHECK_RUSSIA="${CHECK_RUSSIA:-1}"             # 1 = проверить доступность портов из РФ
 FORCE_REINSTALL="${FORCE_REINSTALL:-0}"
+REPO_REF="${REPO_REF:-main}"                    # ветка/коммит репозитория для дозагрузки aggsub.py
 
 # Отобранные рабочие варианты (проверено из РФ):
 DONOR_CHOICES=(www.nvidia.com www.asus.com www.sony.com www.lg.com www.samsung.com)
@@ -71,6 +73,11 @@ ask_choice() { # $1=prompt  $2=varname  $3...=choices ; первый = дефо�
     [[ "$sel" =~ ^[0-9]+$ ]] && [ "$sel" -ge 1 ] && [ "$sel" -le "${#choices[@]}" ] && printf -v "$var" '%s' "${choices[$((sel-1))]}" || printf -v "$var" '%s' "${choices[0]}"
   else printf -v "$var" '%s' "${choices[0]}"; fi
 }
+ask_text() { # $1=prompt  $2=varname  $3=default
+  local prompt="$1" var="$2" def="$3" v
+  if [ -t 0 ]; then read -r -p "$(echo -e "${C_B}$prompt${C_N} [$def]: ")" v </dev/tty || v=""; printf -v "$var" '%s' "${v:-$def}"
+  else printf -v "$var" '%s' "$def"; fi
+}
 
 # ───────────────────────────── 0. Pre-flight ─────────────────────────────
 step "Pre-flight"
@@ -84,7 +91,9 @@ export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a
 step "Параметры маскировки"
 [ -n "$SNI_DONOR" ]  || ask_choice "Под какой сайт маскировать VLESS (Reality donor)?" SNI_DONOR "${DONOR_CHOICES[@]}"
 [ -n "$VLESS_PORT" ] || ask_choice "Порт для VLESS (рабочие в РФ):" VLESS_PORT "${PORT_CHOICES[@]}"
-ok "донор: $SNI_DONOR · порт VLESS: $VLESS_PORT · порт AWG(UDP): $AWG_PORT"
+[ -n "$SRV_LABEL" ] || ask_text "Метка сервера (префикс в именах конфигов, напр. DE/FI/NL)" SRV_LABEL "S1"
+SRV_LABEL="$(printf '%s' "$SRV_LABEL" | tr -cd 'A-Za-z0-9._-')"; [ -n "$SRV_LABEL" ] || SRV_LABEL="S1"
+ok "донор: $SNI_DONOR · порт VLESS: $VLESS_PORT · метка: $SRV_LABEL · порт AWG(UDP): $AWG_PORT"
 
 # ───────────────────────────── 2. Зависимости ─────────────────────────────
 step "Зависимости"
@@ -232,7 +241,7 @@ echo "$PEOPLE" | jq -r '.[].name' | while read -r nm; do
   # клиентский .conf (современный 2.0)
   { printf '[Interface]\nAddress = %s/32\nDNS = 1.1.1.1, 8.8.8.8\nPrivateKey = %s\n' "$cip" "$cpriv"; printf '%b\n' "$OBFS_CLI";
     printf '\n[Peer]\nPublicKey = %s\nPresharedKey = %s\nAllowedIPs = 0.0.0.0/0, ::/0\nEndpoint = %s:%s\nPersistentKeepalive = 25\n' "$AWG_SRV_PUB" "$psk" "$PUBIP" "$AWG_PORT"; } > "$AWGDIR/${nm}.conf"
-  qrencode -r "$AWGDIR/${nm}.conf" -o "$AWGQR/${nm}.png" 2>/dev/null || true
+  qrencode -r "$AWGDIR/${nm}.conf" -s 10 -m 2 -o "$AWGQR/${nm}.png" 2>/dev/null || true
   idx=$((idx+1))
 done
 chmod 600 "$AWGCONF"
@@ -287,12 +296,13 @@ ok "фаервол применён (22, $PANEL_PORT, $VLESS_PORT, $SUB_PORT, $A
 # ───────────────────────────── 10. Раздача: aggsub.py (/sub /awg /p) ─────────────────────────────
 step "Сервис раздачи (персональные страницы /p)"
 printf '%s' "$PEOPLE" | jq -r '.[]|"\(.sub)\t\(.name)"' > "$WORKDIR/awg/submap.tsv"
-# VLESS-ссылки + QR на человека
+printf '%s' "$SRV_LABEL" > "$WORKDIR/awg/label"
+# VLESS-ссылки + QR на человека (с префиксом сервера в названии)
 echo "$PEOPLE" | jq -r '.[]|"\(.name) \(.uuid)"' | while read -r nm uid; do
-  link="vless://${uid}@${PUBIP}:${VLESS_PORT}?encryption=none&flow=xtls-rprx-vision&fp=chrome&pbk=${REALITY_PUBLIC_KEY}&security=reality&sid=${REALITY_SHORT_ID}&sni=${SNI_DONOR}&spx=%2F#${nm}"
-  printf '%s' "$link" > "$DIST/${nm}.vless"; qrencode -o "$DIST/${nm}-vless.png" "$link" 2>/dev/null || true
+  link="vless://${uid}@${PUBIP}:${VLESS_PORT}?encryption=none&flow=xtls-rprx-vision&fp=chrome&pbk=${REALITY_PUBLIC_KEY}&security=reality&sid=${REALITY_SHORT_ID}&sni=${SNI_DONOR}&spx=%2F#${SRV_LABEL}-${nm}"
+  printf '%s' "$link" > "$DIST/${nm}.vless"; qrencode -s 10 -m 2 -o "$DIST/${nm}-vless.png" "$link" 2>/dev/null || true
 done
-curl -fsSL "https://raw.githubusercontent.com/denis-ne-normis/server-init/main/aggsub.py" -o /root/aggsub.py 2>/dev/null || cp "$WORKDIR/aggsub.py" /root/aggsub.py 2>/dev/null || true
+curl -fsSL "https://raw.githubusercontent.com/denis-ne-normis/server-init/${REPO_REF}/aggsub.py" -o /root/aggsub.py 2>/dev/null || cp "$WORKDIR/aggsub.py" /root/aggsub.py 2>/dev/null || true
 if [ ! -f /root/aggsub.py ]; then warn "aggsub.py не найден в репозитории — страницы /p будут недоступны (см. README)"; else
   cat > /etc/systemd/system/aggsub.service <<UNIT
 [Unit]
@@ -343,6 +353,7 @@ PANEL_USER=$PANEL_USER
 PANEL_PASS=$PANEL_PASS
 SNI_DONOR=$SNI_DONOR
 VLESS_PORT=$VLESS_PORT
+SRV_LABEL=$SRV_LABEL
 REALITY_PRIVATE_KEY=$REALITY_PRIVATE_KEY
 REALITY_PUBLIC_KEY=$REALITY_PUBLIC_KEY
 REALITY_SHORT_ID=$REALITY_SHORT_ID
