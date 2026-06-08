@@ -1,140 +1,150 @@
 #!/usr/bin/env bash
 #
 # ════════════════════════════════════════════════════════════════════════════
-#  One-click VPN installer — 3x-ui + двойной VLESS+Reality (XHTTP + TCP/Vision)
-#  Чистый Ubuntu 24.04 / Debian 12 (amd64), root.
+#  One-click VPN installer (modern) — на чистом Ubuntu 24.04 / Debian 12, root.
 #
-#  Делает с нуля, идемпотентно:
-#    • apt update/upgrade + зависимости
-#    • BBR + сетевой тюнинг, синхронизация времени
-#    • панель 3x-ui (фикс. версия = Xray-core 26.6.1)
-#    • хардинг: случайный путь/порт/логин/пароль, HTTPS (LE для IP или self-signed)
-#    • Канал A: VLESS + XHTTP + Reality (TCP/443) — основной, стелс
-#    • Канал B: VLESS + Reality + TCP + Vision (TCP/8443) — резерв, совместимость
-#    • КЛИЕНТЫ создаются связанными на обоих каналах (один UUID + один subId)
-#    • ПОДПИСКА: одна ссылка/QR на человека = оба канала (авто-обновление)
-#    • фаервол nftables (deny-by-default, SSH-safe, блок исходящего SMTP)
-#    • самопроверка: прогон трафика через ОБА канала для каждого клиента
-#    • опционально: проверка доступности из России (check-host.net)
+#  Ставит за пару кликов, идемпотентно:
+#    • apt upgrade + зависимости, BBR/тюнинг, синхронизация времени
+#    • 3x-ui (пин Xray-core 26.x) + хардинг (рандом путь/порт/логин/пароль, HTTPS)
+#    • VLESS + Reality + Vision (1 канал, роутеро-совместимый) на рабочем порту
+#    • AmneziaWG 2.0 (современный, S3/S4+I1) + NAT — UDP-запас, не палится DPI
+#    • N клиентов (по умолчанию 6) — у каждого VLESS + AWG, общий subId
+#    • персональная страница раздачи на человека: /p/<subId> (QR + оба конфига)
+#    • фаервол nftables (deny-by-default, SSH-safe, блок SMTP), self-test
 #
-#  Несколько серверов с ОДИНАКОВЫМИ клиентами (для одной общей подписки):
-#    на 1-м сервере возьми CLIENTS_JSON из /root/vpn-setup/secrets.env и запусти
-#    им же на остальных:  CLIENTS_JSON='[...]' bash <(curl -fsSL .../install.sh)
+#  Интерактивно спросит донора Reality и порт VLESS (можно задать через env).
+#  Одинаковые клиенты на разных серверах: возьми CLIENTS_JSON из secrets.env
+#  первого сервера и передай его при запуске на остальных.
 #
 #  Запуск:  bash <(curl -fsSL https://raw.githubusercontent.com/denis-ne-normis/server-init/main/install.sh)
-#  Несколько клиентов:  CLIENTS="denis vlad liza parents" bash <(curl -fsSL ...)
-#  Повторный запуск безопасен (переиспользует ранее сгенерированные секреты).
 # ════════════════════════════════════════════════════════════════════════════
 set -Eeuo pipefail
 
-# ───────────────────────────── CONFIG (можно править) ──────────────────────────
+# ───────────────────────────── CONFIG (env override) ──────────────────────────
 XUI_VERSION="${XUI_VERSION:-v3.2.8}"          # пин панели (=> Xray-core 26.6.1). "" = latest
-SNI_DONOR="${SNI_DONOR:-www.microsoft.com}"   # донор Reality (TLS1.3+H2+X25519, глобальный CDN)
-VLESS_PORT="${VLESS_PORT:-443}"               # Канал A: VLESS+XHTTP+Reality (TCP)
-VISION_PORT="${VISION_PORT:-8443}"            # Канал B: VLESS+Reality+TCP+Vision
-PANEL_PORT="${PANEL_PORT:-}"                    # порт панели; пусто => случайный
-CLIENTS="${CLIENTS:-client-1}"                 # список клиентов через пробел (на ОБОИХ каналах, связанные)
-SUB_PORT="${SUB_PORT:-2096}"                    # порт подписки 3x-ui
-ENABLE_SUB="${ENABLE_SUB:-1}"                  # 1 = открыть порт подписки и выдавать sub-ссылки
-ENABLE_BACKUP="${ENABLE_BACKUP:-1}"            # 1 = поднять резервный канал B (Vision)
-BLOCK_SMTP="${BLOCK_SMTP:-1}"                   # 1 = блокировать исходящий SMTP (анти-абуз)
-CHECK_RUSSIA="${CHECK_RUSSIA:-1}"              # 1 = проверить доступность портов из РФ (check-host.net)
-FORCE_REINSTALL="${FORCE_REINSTALL:-0}"        # 1 = переустановить панель, даже если уже стоит
+SNI_DONOR="${SNI_DONOR:-}"                     # донор Reality; пусто => спросит интерактивно
+VLESS_PORT="${VLESS_PORT:-}"                   # порт VLESS; пусто => спросит интерактивно
+PANEL_PORT="${PANEL_PORT:-}"                   # порт панели; пусто => случайный
+CLIENTS="${CLIENTS:-denis vlad liza parents router svyt}"  # имена клиентов (без vless-main)
+AWG_PORT="${AWG_PORT:-39743}"                  # UDP-порт AmneziaWG
+AWG_SUBNET="${AWG_SUBNET:-10.9.7}"            # /24 подсеть AWG (сервер = .1)
+SUB_PORT="${SUB_PORT:-2096}"                   # порт подписки 3x-ui
+AGG_PORT="${AGG_PORT:-2087}"                   # порт раздачи (персональные страницы /p)
+BLOCK_SMTP="${BLOCK_SMTP:-1}"                  # 1 = блокировать исходящий SMTP
+CHECK_RUSSIA="${CHECK_RUSSIA:-1}"             # 1 = проверить доступность портов из РФ
+FORCE_REINSTALL="${FORCE_REINSTALL:-0}"
 
-WORKDIR="/root/vpn-setup"
-SECRETS="$WORKDIR/secrets.env"
-CLIENTS_TXT="$WORKDIR/clients.txt"
-HANDOFF="/root/vpn-handoff.md"
-LOG="/var/log/vpn-install.log"
-XRAY_FLOOR_MAJOR=26
+# Отобранные рабочие варианты (проверено из РФ):
+DONOR_CHOICES=(www.nvidia.com www.asus.com www.sony.com www.lg.com www.samsung.com)
+PORT_CHOICES=(7443 8880 7444 7445)
+
+# AmneziaWG 2.0 obfs (рабочий набор; одинаков на сервере и у клиентов):
+AWG_JC=5; AWG_JMIN=10; AWG_JMAX=50; AWG_S1=128; AWG_S2=96; AWG_S3=41; AWG_S4=5
+AWG_H1="1710377591-1722398516"; AWG_H2="1818569401-2116313076"
+AWG_H3="2127718891-2143330769"; AWG_H4="2145494949-2146588297"
+AWG_I1='<r 2><b 0x858000010001000000000669636c6f756403636f6d0000010001c00c000100010000105a00044d583737>'
+
+WORKDIR="/root/vpn-setup"; SECRETS="$WORKDIR/secrets.env"
+AWGDIR="$WORKDIR/awg/clients"; AWGQR="$WORKDIR/awg/qr"; DIST="$WORKDIR/dist"
+AWGCONF="/etc/amnezia/amneziawg/awg0.conf"
+HANDOFF="/root/vpn-handoff.md"; LOG="/var/log/vpn-install.log"
 INSTALL_SH="https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh"
 SUB_PATH="/sub/"
 # ────────────────────────────────────────────────────────────────────────────────
 
 C_G='\033[0;32m'; C_Y='\033[0;33m'; C_R='\033[0;31m'; C_B='\033[0;34m'; C_N='\033[0m'
-mkdir -p "$WORKDIR"; chmod 700 "$WORKDIR"; : > "$LOG"
+mkdir -p "$WORKDIR" "$AWGDIR" "$AWGQR" "$DIST"; chmod 700 "$WORKDIR"; : > "$LOG"
 log()  { echo -e "$*" | tee -a "$LOG" >/dev/null; }
 step() { echo -e "\n${C_B}━━▶ $*${C_N}" | tee -a "$LOG"; }
 ok()   { echo -e "  ${C_G}✓${C_N} $*" | tee -a "$LOG"; }
 warn() { echo -e "  ${C_Y}!${C_N} $*" | tee -a "$LOG"; }
 die()  { echo -e "\n${C_R}✗ ОШИБКА: $*${C_N}\n  Лог: $LOG" | tee -a "$LOG"; exit 1; }
-# shellcheck disable=SC2154  # rc присваивается внутри самой trap-строки
-trap 'rc=$?; [ $rc -ne 0 ] && echo -e "\n${C_R}✗ Прервано на строке $LINENO (код $rc). Последние строки лога:${C_N}" && tail -n 15 "$LOG"; exit $rc' ERR
+# shellcheck disable=SC2154
+trap 'rc=$?; [ $rc -ne 0 ] && echo -e "\n${C_R}✗ Прервано на строке $LINENO (код $rc). Хвост лога:${C_N}" && tail -n 15 "$LOG"; exit $rc' ERR
 require() { command -v "$1" >/dev/null 2>&1 || die "нет команды: $1"; }
+ask_choice() { # $1=prompt  $2=varname  $3...=choices ; первый = дефолт
+  local prompt="$1" var="$2"; shift 2; local choices=("$@") i sel
+  if [ -t 0 ]; then
+    echo -e "${C_B}$prompt${C_N}" >&2
+    for i in "${!choices[@]}"; do echo "   $((i+1))) ${choices[$i]}" >&2; done
+    read -r -p "   выбор [1-${#choices[@]}, Enter=1]: " sel </dev/tty || sel=""
+    [[ "$sel" =~ ^[0-9]+$ ]] && [ "$sel" -ge 1 ] && [ "$sel" -le "${#choices[@]}" ] && printf -v "$var" '%s' "${choices[$((sel-1))]}" || printf -v "$var" '%s' "${choices[0]}"
+  else printf -v "$var" '%s' "${choices[0]}"; fi
+}
 
 # ───────────────────────────── 0. Pre-flight ─────────────────────────────
 step "Pre-flight"
 [ "$(id -u)" -eq 0 ] || die "запускать от root"
 . /etc/os-release 2>/dev/null || die "не вижу /etc/os-release"
-case "${ID:-}" in ubuntu|debian) ok "ОС: $PRETTY_NAME" ;; *) warn "ОС $PRETTY_NAME не тестировалась (ожидается Ubuntu/Debian)";; esac
-[ "$(uname -m)" = "x86_64" ] || die "нужен amd64 (x86_64), у вас $(uname -m)"
+case "${ID:-}" in ubuntu|debian) ok "ОС: $PRETTY_NAME" ;; *) warn "ОС $PRETTY_NAME не тестировалась";; esac
+[ "$(uname -m)" = "x86_64" ] || die "нужен amd64 (x86_64)"
 export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a
 
-# ───────────────────────────── 1. Зависимости ─────────────────────────────
-step "Установка зависимостей"
+# ───────────────────────────── 1. Выбор донора и порта ─────────────────────────────
+step "Параметры маскировки"
+[ -n "$SNI_DONOR" ]  || ask_choice "Под какой сайт маскировать VLESS (Reality donor)?" SNI_DONOR "${DONOR_CHOICES[@]}"
+[ -n "$VLESS_PORT" ] || ask_choice "Порт для VLESS (рабочие в РФ):" VLESS_PORT "${PORT_CHOICES[@]}"
+ok "донор: $SNI_DONOR · порт VLESS: $VLESS_PORT · порт AWG(UDP): $AWG_PORT"
+
+# ───────────────────────────── 2. Зависимости ─────────────────────────────
+step "Зависимости"
 apt-get update -y >>"$LOG" 2>&1
 apt-get -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" upgrade >>"$LOG" 2>&1
-apt-get install -y curl wget jq qrencode openssl ca-certificates nftables socat dnsutils uuid-runtime >>"$LOG" 2>&1
+apt-get install -y curl wget jq qrencode openssl ca-certificates nftables socat dnsutils uuid-runtime software-properties-common >>"$LOG" 2>&1
 for c in curl jq qrencode openssl nft; do require "$c"; done
-ok "зависимости установлены"
+ok "базовые зависимости установлены"
+# AmneziaWG
+step "Установка AmneziaWG (ядро + tools)"
+if ! command -v awg >/dev/null 2>&1; then
+  if [ "${ID:-}" = "ubuntu" ]; then add-apt-repository -y ppa:amnezia/ppa >>"$LOG" 2>&1
+  else echo "deb https://ppa.launchpadcontent.net/amnezia/ppa/ubuntu jammy main" >/etc/apt/sources.list.d/amnezia.list 2>/dev/null || true; fi
+  apt-get update -y >>"$LOG" 2>&1
+  apt-get install -y "linux-headers-$(uname -r)" >>"$LOG" 2>&1 || apt-get install -y linux-headers-generic >>"$LOG" 2>&1 || true
+  apt-get install -y amneziawg amneziawg-tools >>"$LOG" 2>&1 || apt-get install -y amneziawg-dkms amneziawg-tools >>"$LOG" 2>&1 || die "не удалось поставить amneziawg (см. $LOG)"
+fi
+modprobe amneziawg 2>/dev/null || true
+command -v awg >/dev/null 2>&1 || die "awg не установился"
+ok "AmneziaWG: $(awg --version 2>/dev/null | head -1 || echo установлен)"
 PUBIP="$(curl -fsS4 --max-time 10 https://api.ipify.org 2>/dev/null || true)"
 [ -n "$PUBIP" ] || PUBIP="$(ip -4 route get 1.1.1.1 2>/dev/null | grep -oP 'src \K\S+' | head -1)"
 [ -n "$PUBIP" ] || die "не определил публичный IP"
-ok "публичный IP: $PUBIP"
+WANIF="$(ip -4 route get 1.1.1.1 2>/dev/null | grep -oP 'dev \K\S+' | head -1)"; [ -n "$WANIF" ] || WANIF=eth0
+ok "публичный IP: $PUBIP · внешний интерфейс: $WANIF"
 
-# ───────────────────────────── 2. BBR + тюнинг + время ─────────────────────────────
-step "Сетевой тюнинг (BBR) и время"
+# ───────────────────────────── 3. BBR + форвардинг + время ─────────────────────────────
+step "Тюнинг (BBR), IP-forward, время"
 cat > /etc/sysctl.d/99-vpn.conf <<'SYSCTL'
 net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr
 net.core.rmem_max=16777216
 net.core.wmem_max=16777216
-net.core.rmem_default=1048576
-net.core.wmem_default=1048576
 net.ipv4.tcp_rmem=4096 1048576 16777216
 net.ipv4.tcp_wmem=4096 65536 16777216
-net.ipv4.udp_rmem_min=8192
-net.ipv4.udp_wmem_min=8192
 net.core.netdev_max_backlog=16384
 net.ipv4.tcp_fastopen=3
 net.ipv4.tcp_mtu_probing=1
 net.ipv4.tcp_slow_start_after_idle=0
-net.ipv4.tcp_notsent_lowat=131072
+net.ipv4.ip_forward=1
 fs.file-max=1048576
 SYSCTL
-modprobe tcp_bbr 2>/dev/null || true
-echo tcp_bbr > /etc/modules-load.d/bbr.conf
+modprobe tcp_bbr 2>/dev/null || true; echo tcp_bbr > /etc/modules-load.d/bbr.conf
 sysctl --system >>"$LOG" 2>&1
-[ "$(sysctl -n net.ipv4.tcp_congestion_control)" = "bbr" ] && ok "BBR активен ($(sysctl -n net.core.default_qdisc) qdisc)" || warn "BBR не подтвердился"
-timedatectl set-ntp true 2>/dev/null || true
-ok "NTP включён (критично для Reality)"
+[ "$(sysctl -n net.ipv4.tcp_congestion_control)" = "bbr" ] && ok "BBR активен" || warn "BBR не подтвердился"
+timedatectl set-ntp true 2>/dev/null || true; ok "NTP включён (критично для Reality)"
 
-# ───────────────────────────── 3. Установка 3x-ui ─────────────────────────────
-step "Установка панели 3x-ui ($XUI_VERSION)"
-if [ -x /usr/local/x-ui/x-ui ] && [ "$FORCE_REINSTALL" != "1" ]; then
-  ok "3x-ui уже установлена — пропускаю (FORCE_REINSTALL=1 чтобы переставить)"
-else
-  if [ -n "$XUI_VERSION" ]; then
-    bash <(curl -Ls "$INSTALL_SH") "$XUI_VERSION" < /dev/null >>"$LOG" 2>&1 || die "установщик 3x-ui завершился с ошибкой (см. $LOG)"
-  else
-    bash <(curl -Ls "$INSTALL_SH") < /dev/null >>"$LOG" 2>&1 || die "установщик 3x-ui завершился с ошибкой (см. $LOG)"
-  fi
-  ok "3x-ui установлена"
-fi
+# ───────────────────────────── 4. 3x-ui ─────────────────────────────
+step "Установка 3x-ui ($XUI_VERSION)"
+if [ -x /usr/local/x-ui/x-ui ] && [ "$FORCE_REINSTALL" != "1" ]; then ok "3x-ui уже стоит — пропускаю"
+else bash <(curl -Ls "$INSTALL_SH") ${XUI_VERSION:+"$XUI_VERSION"} < /dev/null >>"$LOG" 2>&1 || die "установщик 3x-ui упал (см. $LOG)"; ok "3x-ui установлена"; fi
 XUIBIN=/usr/local/x-ui/x-ui
-XRAYBIN="$(ls /usr/local/x-ui/bin/xray-linux-* 2>/dev/null | head -1)"; [ -x "$XRAYBIN" ] || die "не нашёл бинарь xray"
-XRAY_VER="$("$XRAYBIN" -version 2>/dev/null | grep -oP 'Xray \K[0-9.]+' | head -1)"
-ok "Xray-core: $XRAY_VER"
-[ "${XRAY_VER%%.*}" -ge "$XRAY_FLOOR_MAJOR" ] 2>/dev/null || warn "Xray-core < $XRAY_FLOOR_MAJOR.x — возможны проблемы с XHTTP"
+XRAYBIN="$(ls /usr/local/x-ui/bin/xray-linux-* 2>/dev/null | head -1)"; [ -x "$XRAYBIN" ] || die "не нашёл xray"
+XRAY_VER="$("$XRAYBIN" -version 2>/dev/null | grep -oP 'Xray \K[0-9.]+' | head -1)"; ok "Xray-core: $XRAY_VER"
 
-# ───────────────────────────── 4. Секреты + клиенты ─────────────────────────────
+# ───────────────────────────── 5. Секреты + клиенты ─────────────────────────────
 step "Секреты и клиенты"
 gen_alnum() { local s; s="$(openssl rand -base64 "$1" | tr -dc 'A-Za-z0-9')"; printf '%s' "${s:0:$2}"; }
-if [ -f "$SECRETS" ]; then
-  ok "найден $SECRETS — переиспользую секреты"
-  # shellcheck disable=SC1090
-  . "$SECRETS"
-fi
+# shellcheck disable=SC1090
+[ -f "$SECRETS" ] && { ok "переиспользую $SECRETS"; . "$SECRETS"; }
 PANEL_USER="${PANEL_USER:-admin_$(gen_alnum 12 8)}"
 PANEL_PASS="${PANEL_PASS:-$(gen_alnum 48 32)}"
 PANEL_PATH_RAW="${PANEL_PATH_RAW:-$(gen_alnum 36 18)}"
@@ -145,50 +155,40 @@ if [ -z "${REALITY_PRIVATE_KEY:-}" ] || [ -z "${REALITY_PUBLIC_KEY:-}" ]; then
   REALITY_PUBLIC_KEY="$(echo "$KP"  | grep -iE 'public|password' | awk -F: '{print $2}' | tr -d ' ' | head -1)"
 fi
 REALITY_SHORT_ID="${REALITY_SHORT_ID:-$(openssl rand -hex 8)}"
-VLESS_PATH="${VLESS_PATH:-/api/v1/$(openssl rand -hex 4)}"
-# PEOPLE: [{name,uuid,sub}] — один UUID + один subId на человека = связь обоих каналов.
+# PEOPLE: [{name,uuid,sub}] — общий subId на человека (одинаковый на всех серверах через CLIENTS_JSON)
 PEOPLE="${CLIENTS_JSON:-[]}"
-# Одинаковые клиенты на всех серверах: если передан CLIENTS_JSON, берём список людей из него.
-if [ "$CLIENTS" = "client-1" ] && [ "$(echo "$PEOPLE" | jq 'length')" -gt 0 ]; then
-  CLIENTS="$(echo "$PEOPLE" | jq -r '[.[].name]|join(" ")')"
-fi
+[ "$(echo "$PEOPLE" | jq 'length')" -gt 0 ] && CLIENTS="$(echo "$PEOPLE" | jq -r '[.[].name]|join(" ")')"
 for name in $CLIENTS; do
-  if ! echo "$PEOPLE" | jq -e --arg n "$name" 'any(.[]?; .name==$n)' >/dev/null 2>&1; then
+  echo "$PEOPLE" | jq -e --arg n "$name" 'any(.[]?; .name==$n)' >/dev/null 2>&1 || \
     PEOPLE="$(echo "$PEOPLE" | jq -c --arg n "$name" --arg u "$("$XRAYBIN" uuid)" --arg s "$(gen_alnum 24 16)" '. + [{name:$n,uuid:$u,sub:$s}]')"
-  fi
 done
-CLIENTS_A="$(echo "$PEOPLE" | jq -c '[.[]|{id:.uuid,flow:"",email:.name,limitIp:0,totalGB:0,expiryTime:0,enable:true,tgId:"",subId:.sub,comment:"",reset:0}]')"
-CLIENTS_B="$(echo "$PEOPLE" | jq -c '[.[]|{id:.uuid,flow:"xtls-rprx-vision",email:(.name+"-tcp"),limitIp:0,totalGB:0,expiryTime:0,enable:true,tgId:"",subId:.sub,comment:"",reset:0}]')"
-ok "клиентов: $(echo "$PEOPLE" | jq -r '[.[].name]|join(", ")')"
+NP="$(echo "$PEOPLE" | jq 'length')"
+CLIENTS_J="$(echo "$PEOPLE" | jq -c '[.[]|{id:.uuid,flow:"xtls-rprx-vision",email:.name,limitIp:0,totalGB:0,expiryTime:0,enable:true,tgId:"",subId:.sub,comment:"",reset:0}]')"
+ok "клиентов: $NP ($(echo "$PEOPLE" | jq -r '[.[].name]|join(", ")'))"
 
-# ───────────────────────────── 5. Хардинг панели ─────────────────────────────
-step "Хардинг панели (путь/порт/логин/пароль/HTTPS)"
+# ───────────────────────────── 6. Хардинг панели ─────────────────────────────
+step "Хардинг панели + HTTPS"
 "$XUIBIN" setting -username "$PANEL_USER" -password "$PANEL_PASS" -port "$PANEL_PORT" -webBasePath "$PANEL_PATH_RAW" >>"$LOG" 2>&1
 CERT_LINE="$("$XUIBIN" setting -getCert 2>/dev/null || true)"
 PANEL_CERT="$(echo "$CERT_LINE" | grep -i 'cert:' | awk '{print $2}')"
 PANEL_KEY="$(echo  "$CERT_LINE" | grep -i 'key:'  | awk '{print $2}')"
-if [ -z "$PANEL_CERT" ] || [ ! -f "$PANEL_CERT" ] || [ -z "$PANEL_KEY" ] || [ ! -f "$PANEL_KEY" ]; then
-  warn "сертификата панели нет — генерирую self-signed"
+if [ -z "$PANEL_CERT" ] || [ ! -f "$PANEL_CERT" ]; then
   mkdir -p /root/cert/panel
   openssl req -x509 -nodes -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -days 3650 \
     -keyout /root/cert/panel/private.key -out /root/cert/panel/cert.crt \
     -subj "/CN=$PUBIP" -addext "subjectAltName=IP:$PUBIP" >>"$LOG" 2>&1
-  "$XUIBIN" setting -webCert /root/cert/panel/cert.crt -webCertKey /root/cert/panel/private.key >>"$LOG" 2>&1
-  ok "self-signed сертификат панели подключён"
+  PANEL_CERT=/root/cert/panel/cert.crt; PANEL_KEY=/root/cert/panel/private.key
+  "$XUIBIN" setting -webCert "$PANEL_CERT" -webCertKey "$PANEL_KEY" >>"$LOG" 2>&1
+  ok "self-signed сертификат панели"
 else ok "сертификат панели: $PANEL_CERT"; fi
-systemctl enable x-ui >>"$LOG" 2>&1 || true
-systemctl restart x-ui; sleep 2
+systemctl enable x-ui >>"$LOG" 2>&1 || true; systemctl restart x-ui; sleep 2
 PANEL_PORT="$("$XUIBIN" setting -show 2>/dev/null | grep -i '^port' | awk '{print $2}')"
 PANEL_PATH="$("$XUIBIN" setting -show 2>/dev/null | grep -i 'webBasePath' | awk '{print $2}')"
-[ -n "$PANEL_PORT" ] && [ -n "$PANEL_PATH" ] || die "не прочитал настройки панели"
 BASE="https://127.0.0.1:${PANEL_PORT}${PANEL_PATH%/}"
-for i in $(seq 1 20); do
-  [ "$(curl -sk -m4 -o /dev/null -w '%{http_code}' "$BASE/" 2>/dev/null)" = "200" ] && break
-  sleep 1; [ "$i" = "20" ] && die "панель не поднялась за 20с"
-done
-ok "панель отвечает: порт $PANEL_PORT путь $PANEL_PATH"
+for i in $(seq 1 20); do [ "$(curl -sk -m4 -o /dev/null -w '%{http_code}' "$BASE/" 2>/dev/null)" = "200" ] && break; sleep 1; [ "$i" = "20" ] && die "панель не поднялась"; done
+ok "панель отвечает: порт $PANEL_PORT"
 
-# ───────────────────────────── 6. API-хелперы (cookie + CSRF) ─────────────────────────────
+# ───────────────────────────── 7. API + VLESS+Reality+Vision ─────────────────────────────
 CK="$WORKDIR/.cookies"; : > "$CK"; chmod 600 "$CK"
 api_login() { local c; c=$(curl -sk -c "$CK" "$BASE/csrf-token" | jq -r '.obj // empty')
   curl -sk -b "$CK" -c "$CK" -X POST "$BASE/login" -H "X-CSRF-Token: $c" -H 'Content-Type: application/json' \
@@ -196,47 +196,53 @@ api_login() { local c; c=$(curl -sk -c "$CK" "$BASE/csrf-token" | jq -r '.obj //
 api_post() { local c; c=$(curl -sk -b "$CK" "$BASE/csrf-token" | jq -r '.obj // empty')
   curl -sk -b "$CK" -X POST "$BASE$1" -H "X-CSRF-Token: $c" -H 'Content-Type: application/json' -d "$2"; }
 api_get()  { curl -sk -b "$CK" "$BASE$1"; }
-inbound_exists() { api_get "/panel/api/inbounds/list" | jq -e --arg r "$1" '.obj[]?|select(.remark==$r)' >/dev/null 2>&1; }
-step "Авторизация в панели (API)"; api_login || die "не удалось залогиниться в панель API"; ok "API-сессия установлена"
-# настройки подписки (порт/путь) из панели
-SUBINFO="$(api_post "/panel/setting/all" "" 2>/dev/null || echo '{}')"
-SP="$(echo "$SUBINFO" | jq -r '.obj.subPort // empty')"; [ -n "$SP" ] && SUB_PORT="$SP"
-SPATH="$(echo "$SUBINFO" | jq -r '.obj.subPath // empty')"; [ -n "$SPATH" ] && SUB_PATH="$SPATH"
-[ "$(echo "$SUBINFO" | jq -r '.obj.subEnable // false')" = "true" ] || warn "подписка в панели выключена — включи в Панель→Настройки→Подписка"
-
+step "VLESS + Reality + Vision (TCP/$VLESS_PORT, донор $SNI_DONOR)"
+api_login || die "не залогинился в панель API"
+echo Q | openssl s_client -connect "${SNI_DONOR}:443" -servername "$SNI_DONOR" -alpn h2 2>/dev/null | grep -q 'Verify return code: 0' \
+  && ok "донор $SNI_DONOR валиден (TLS ok)" || warn "донор $SNI_DONOR не прошёл быстрый TLS-чек"
+# ВАЖНО: панель использует поле target (не dest) — иначе XHTTP/новые сборки не цепляются
 REALITY_JSON="$(jq -cn --arg priv "$REALITY_PRIVATE_KEY" --arg pub "$REALITY_PUBLIC_KEY" --arg sid "$REALITY_SHORT_ID" --arg donor "$SNI_DONOR" \
-  '{show:false,dest:($donor+":443"),xver:0,serverNames:[$donor],privateKey:$priv,shortIds:["",$sid],settings:{publicKey:$pub,fingerprint:"chrome",spiderX:"/"}}')"
+  '{show:false,target:($donor+":443"),xver:0,serverNames:[$donor],privateKey:$priv,shortIds:[$sid],settings:{publicKey:$pub,fingerprint:"chrome",spiderX:"/"}}')"
 SNIFF="$(jq -cn '{enabled:true,destOverride:["http","tls","quic"],metadataOnly:false,routeOnly:false}')"
-
-# ───────────────────────────── 7. Канал A: VLESS+XHTTP+Reality ─────────────────────────────
-step "Канал A — VLESS + XHTTP + Reality (TCP/$VLESS_PORT)"
-echo Q | openssl s_client -connect "${SNI_DONOR}:443" -servername "$SNI_DONOR" -alpn h2 2>/dev/null \
-  | grep -q 'Verify return code: 0' && ok "донор $SNI_DONOR валиден (TLS ok)" || warn "донор $SNI_DONOR не прошёл быстрый TLS-чек"
-if inbound_exists "VLESS-XHTTP-Reality"; then ok "канал A уже есть — пропускаю"; else
-  S=$(jq -cn --argjson cl "$CLIENTS_A" '{clients:$cl,decryption:"none",fallbacks:[]}')
-  ST=$(jq -cn --arg path "$VLESS_PATH" --argjson reality "$REALITY_JSON" '{network:"xhttp",security:"reality",xhttpSettings:{host:"",path:$path,mode:"auto"},realitySettings:$reality}')
-  BODY=$(jq -cn --arg s "$S" --arg st "$ST" --arg sn "$SNIFF" --argjson port "$VLESS_PORT" '{enable:true,remark:"VLESS-XHTTP-Reality",listen:"",port:$port,protocol:"vless",expiryTime:0,settings:$s,streamSettings:$st,sniffing:$sn}')
-  R=$(api_post "/panel/api/inbounds/add" "$BODY"); echo "$R" | jq -e '.success==true' >/dev/null || die "канал A не создан: $(echo "$R" | jq -r '.msg // .')"
-  ok "канал A создан со всеми клиентами"
+if api_get "/panel/api/inbounds/list" | jq -e '.obj[]?|select(.remark=="VLESS-Reality-Vision")' >/dev/null 2>&1; then ok "VLESS-инбаунд уже есть — пропускаю"; else
+  S=$(jq -cn --argjson cl "$CLIENTS_J" '{clients:$cl,decryption:"none",fallbacks:[]}')
+  ST=$(jq -cn --argjson reality "$REALITY_JSON" '{network:"tcp",security:"reality",realitySettings:$reality,tcpSettings:{acceptProxyProtocol:false,header:{type:"none"}}}')
+  BODY=$(jq -cn --arg s "$S" --arg st "$ST" --arg sn "$SNIFF" --argjson port "$VLESS_PORT" '{enable:true,remark:"VLESS-Reality-Vision",listen:"",port:$port,protocol:"vless",expiryTime:0,settings:$s,streamSettings:$st,sniffing:$sn}')
+  R=$(api_post "/panel/api/inbounds/add" "$BODY"); echo "$R" | jq -e '.success==true' >/dev/null || die "VLESS не создан: $(echo "$R" | jq -r '.msg // .')"
+  ok "VLESS создан со всеми клиентами"
 fi
 
-# ───────────────────────────── 8. Канал B: VLESS+Reality+TCP+Vision ─────────────────────────────
-if [ "$ENABLE_BACKUP" = "1" ]; then
-  step "Канал B — VLESS + Reality + TCP + Vision (TCP/$VISION_PORT) — резерв"
-  if inbound_exists "VLESS-TCP-Reality-Vision"; then ok "канал B уже есть — пропускаю"; else
-    S=$(jq -cn --argjson cl "$CLIENTS_B" '{clients:$cl,decryption:"none",fallbacks:[]}')
-    ST=$(jq -cn --argjson reality "$REALITY_JSON" '{network:"tcp",security:"reality",realitySettings:$reality,tcpSettings:{acceptProxyProtocol:false,header:{type:"none"}}}')
-    BODY=$(jq -cn --arg s "$S" --arg st "$ST" --arg sn "$SNIFF" --argjson port "$VISION_PORT" '{enable:true,remark:"VLESS-TCP-Reality-Vision",listen:"",port:$port,protocol:"vless",expiryTime:0,settings:$s,streamSettings:$st,sniffing:$sn}')
-    R=$(api_post "/panel/api/inbounds/add" "$BODY"); echo "$R" | jq -e '.success==true' >/dev/null || die "канал B не создан: $(echo "$R" | jq -r '.msg // .')"
-    ok "канал B создан (те же клиенты, тот же subId = связаны с каналом A)"
-  fi
-else warn "резервный канал B отключён (ENABLE_BACKUP=0)"; fi
+# ───────────────────────────── 8. AmneziaWG 2.0 ─────────────────────────────
+step "AmneziaWG 2.0 ($AWG_SUBNET.0/24, UDP/$AWG_PORT)"
+mkdir -p "$(dirname "$AWGCONF")"
+# серверный приватник
+AWG_SRV_PRIV="${AWG_SRV_PRIV:-$(awg genkey)}"
+AWG_SRV_PUB="$(printf '%s' "$AWG_SRV_PRIV" | awg pubkey)"
+OBFS="Jc = $AWG_JC\nJmin = $AWG_JMIN\nJmax = $AWG_JMAX\nS1 = $AWG_S1\nS2 = $AWG_S2\nS3 = $AWG_S3\nS4 = $AWG_S4\nH1 = $AWG_H1\nH2 = $AWG_H2\nH3 = $AWG_H3\nH4 = $AWG_H4\nI1 = $AWG_I1"
+# server [Interface] (I1 only — старый awg-quick не любит пустые I2-5)
+{ printf '[Interface]\nAddress = %s.1/24\nListenPort = %s\nPrivateKey = %s\n' "$AWG_SUBNET" "$AWG_PORT" "$AWG_SRV_PRIV"; printf '%b\n' "$OBFS"; } > "$AWGCONF"
+# клиентские obfs (с пустыми I2-5 — приложение Amnezia их принимает)
+OBFS_CLI="${OBFS}\nI2 = \nI3 = \nI4 = \nI5 = "
+idx=2
+echo "$PEOPLE" | jq -r '.[].name' | while read -r nm; do
+  cpriv=$(awg genkey); cpub=$(printf '%s' "$cpriv" | awg pubkey); psk=$(awg genpsk); cip="$AWG_SUBNET.$idx"
+  # добавить пир на сервер
+  { printf '\n[Peer]\nPublicKey = %s\nPresharedKey = %s\nAllowedIPs = %s/32\n' "$cpub" "$psk" "$cip"; } >> "$AWGCONF"
+  # клиентский .conf (современный 2.0)
+  { printf '[Interface]\nAddress = %s/32\nDNS = 1.1.1.1, 8.8.8.8\nPrivateKey = %s\n' "$cip" "$cpriv"; printf '%b\n' "$OBFS_CLI";
+    printf '\n[Peer]\nPublicKey = %s\nPresharedKey = %s\nAllowedIPs = 0.0.0.0/0, ::/0\nEndpoint = %s:%s\nPersistentKeepalive = 25\n' "$AWG_SRV_PUB" "$psk" "$PUBIP" "$AWG_PORT"; } > "$AWGDIR/${nm}.conf"
+  qrencode -r "$AWGDIR/${nm}.conf" -o "$AWGQR/${nm}.png" 2>/dev/null || true
+  idx=$((idx+1))
+done
+chmod 600 "$AWGCONF"
+systemctl enable awg-quick@awg0 >>"$LOG" 2>&1 || true
+awg-quick down awg0 2>/dev/null || true
+awg-quick up awg0 >>"$LOG" 2>&1 || die "awg0 не поднялся (см. $LOG)"
+ok "AmneziaWG поднят: $(awg show awg0 | grep -c peer:) пиров"
 
-# ───────────────────────────── 9. Фаервол (nftables) ─────────────────────────────
-step "Фаервол nftables (deny-by-default, SSH-safe)"
+# ───────────────────────────── 9. Фаервол + NAT ─────────────────────────────
+step "Фаервол nftables + NAT для AWG"
 SMTP_RULE=""; [ "$BLOCK_SMTP" = "1" ] && SMTP_RULE='tcp dport { 25, 465, 587 } reject with icmp type admin-prohibited'
-BACKUP_RULE=""; [ "$ENABLE_BACKUP" = "1" ] && BACKUP_RULE="tcp dport $VISION_PORT accept"
-SUB_RULE="";    [ "$ENABLE_SUB" = "1" ]    && SUB_RULE="tcp dport $SUB_PORT accept"
 cat > /etc/nftables.conf <<NFT
 #!/usr/sbin/nft -f
 flush ruleset
@@ -251,71 +257,77 @@ table inet filter {
         tcp dport 22 accept
         tcp dport $PANEL_PORT accept
         tcp dport $VLESS_PORT accept
-        $BACKUP_RULE
-        $SUB_RULE
+        tcp dport $SUB_PORT accept
+        tcp dport $AGG_PORT accept
+        udp dport $AWG_PORT accept
     }
-    chain forward { type filter hook forward priority filter; policy drop; }
-    chain output {
-        type filter hook output priority filter; policy accept;
-        $SMTP_RULE
+    chain forward {
+        type filter hook forward priority filter; policy drop;
+        iifname "awg0" accept
+        oifname "awg0" ct state established,related accept
+    }
+    chain output { type filter hook output priority filter; policy accept; $SMTP_RULE }
+}
+table inet nat {
+    chain postrouting {
+        type nat hook postrouting priority srcnat; policy accept;
+        ip saddr $AWG_SUBNET.0/24 oifname "$WANIF" masquerade
     }
 }
 NFT
 nft -c -f /etc/nftables.conf >>"$LOG" 2>&1 || die "ошибка синтаксиса nftables"
 nohup bash -c 'sleep 90; nft flush ruleset' >/dev/null 2>&1 & RB=$!
-nft -f /etc/nftables.conf
-systemctl enable nftables >>"$LOG" 2>&1 || true
-kill "$RB" 2>/dev/null || true
-ok "фаервол применён и включён в автозагрузку"
+nft -f /etc/nftables.conf; systemctl enable nftables >>"$LOG" 2>&1 || true; kill "$RB" 2>/dev/null || true
+ok "фаервол применён (22, $PANEL_PORT, $VLESS_PORT, $SUB_PORT, $AGG_PORT/tcp, $AWG_PORT/udp)"
 
-# ───────────────────────────── 10. Проверка доступности ─────────────────────────────
-step "Проверка доступности"
-systemctl is-active --quiet x-ui && ok "сервис x-ui активен" || die "x-ui не активен"
-ss -tlnp | grep -q ":$VLESS_PORT " && ok "TCP :$VLESS_PORT слушается (канал A)" || die "нет TCP :$VLESS_PORT"
-[ "$ENABLE_BACKUP" = "1" ] && { ss -tlnp | grep -q ":$VISION_PORT " && ok "TCP :$VISION_PORT слушается (канал B)" || warn "нет TCP :$VISION_PORT"; }
-probe() { # $1=uuid $2=port $3=net(xhttp|tcp)
-  local cfg="$WORKDIR/.probe.json" got
-  if [ "$3" = "xhttp" ]; then
-    jq -n --arg u "$1" --arg ip "$PUBIP" --arg path "$VLESS_PATH" --arg pub "$REALITY_PUBLIC_KEY" --arg sid "$REALITY_SHORT_ID" --arg d "$SNI_DONOR" --argjson p "$2" \
-      '{log:{loglevel:"error"},inbounds:[{tag:"s",listen:"127.0.0.1",port:10991,protocol:"socks",settings:{udp:true}}],outbounds:[{protocol:"vless",settings:{vnext:[{address:$ip,port:$p,users:[{id:$u,encryption:"none",flow:""}]}]},streamSettings:{network:"xhttp",security:"reality",xhttpSettings:{host:"",path:$path,mode:"auto"},realitySettings:{serverName:$d,publicKey:$pub,shortId:$sid,fingerprint:"chrome",spiderX:"/"}}}]}' > "$cfg"
-  else
-    jq -n --arg u "$1" --arg ip "$PUBIP" --arg pub "$REALITY_PUBLIC_KEY" --arg sid "$REALITY_SHORT_ID" --arg d "$SNI_DONOR" --argjson p "$2" \
-      '{log:{loglevel:"error"},inbounds:[{tag:"s",listen:"127.0.0.1",port:10991,protocol:"socks",settings:{udp:true}}],outbounds:[{protocol:"vless",settings:{vnext:[{address:$ip,port:$p,users:[{id:$u,encryption:"none",flow:"xtls-rprx-vision"}]}]},streamSettings:{network:"tcp",security:"reality",realitySettings:{serverName:$d,publicKey:$pub,shortId:$sid,fingerprint:"chrome",spiderX:"/"}}}]}' > "$cfg"
-  fi
-  "$XRAYBIN" run -c "$cfg" >/dev/null 2>&1 & local pid=$!; sleep 5
-  got="$(curl -s --max-time 12 --socks5-hostname 127.0.0.1:10991 https://api.ipify.org 2>/dev/null || true)"
-  kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; rm -f "$cfg"
-  [ "$got" = "$PUBIP" ]
-}
+# ───────────────────────────── 10. Раздача: aggsub.py (/sub /awg /p) ─────────────────────────────
+step "Сервис раздачи (персональные страницы /p)"
+printf '%s' "$PEOPLE" | jq -r '.[]|"\(.sub)\t\(.name)"' > "$WORKDIR/awg/submap.tsv"
+# VLESS-ссылки + QR на человека
 echo "$PEOPLE" | jq -r '.[]|"\(.name) \(.uuid)"' | while read -r nm uid; do
-  probe "$uid" "$VLESS_PORT" xhttp && a="A✅" || a="A❌"
-  if [ "$ENABLE_BACKUP" = "1" ]; then probe "$uid" "$VISION_PORT" tcp && b="B✅" || b="B❌"; else b="B-"; fi
-  ok "клиент $nm: $a $b"
+  link="vless://${uid}@${PUBIP}:${VLESS_PORT}?encryption=none&flow=xtls-rprx-vision&fp=chrome&pbk=${REALITY_PUBLIC_KEY}&security=reality&sid=${REALITY_SHORT_ID}&sni=${SNI_DONOR}&spx=%2F#${nm}"
+  printf '%s' "$link" > "$DIST/${nm}.vless"; qrencode -o "$DIST/${nm}-vless.png" "$link" 2>/dev/null || true
 done
-if [ "$CHECK_RUSSIA" = "1" ]; then
-  ru_check() { local rid; rid=$(curl -s -m10 -H "Accept: application/json" "https://check-host.net/check-tcp?host=${PUBIP}:$1&node=ru1.node.check-host.net&node=ru2.node.check-host.net&node=ru3.node.check-host.net" | jq -r '.request_id // empty')
-    [ -z "$rid" ] && { warn "check-host недоступен"; return; }; sleep 12
-    curl -s -m10 -H "Accept: application/json" "https://check-host.net/check-result/$rid" | jq -r 'to_entries[]|"      \(.key): " + (if .value==null then "⏳" else (.value[0]) as $r|(if ($r|has("error")) then "❌ "+$r.error elif ($r|has("time")) then "✅ "+(($r.time*1000)|floor|tostring)+"ms" else "?" end) end)'; }
-  echo "  доступ из России (порт $VLESS_PORT):"; ru_check "$VLESS_PORT"
-  [ "$ENABLE_BACKUP" = "1" ] && { echo "  доступ из России (порт $VISION_PORT):"; ru_check "$VISION_PORT"; }
+curl -fsSL "https://raw.githubusercontent.com/denis-ne-normis/server-init/main/aggsub.py" -o /root/aggsub.py 2>/dev/null || cp "$WORKDIR/aggsub.py" /root/aggsub.py 2>/dev/null || true
+if [ ! -f /root/aggsub.py ]; then warn "aggsub.py не найден в репозитории — страницы /p будут недоступны (см. README)"; else
+  cat > /etc/systemd/system/aggsub.service <<UNIT
+[Unit]
+Description=VPN personal-config distributor
+After=network.target
+[Service]
+Environment=AGG_CERT=$PANEL_CERT
+Environment=AGG_KEY=$PANEL_KEY
+Environment=AGG_PORT=$AGG_PORT
+ExecStart=/usr/bin/python3 /root/aggsub.py
+Restart=always
+[Install]
+WantedBy=multi-user.target
+UNIT
+  systemctl daemon-reload; systemctl enable aggsub >>"$LOG" 2>&1 || true; systemctl restart aggsub; sleep 1
+  systemctl is-active --quiet aggsub && ok "раздача активна на :$AGG_PORT" || warn "aggsub не поднялся"
 fi
 
-# ───────────────────────────── 11. Ссылки, QR, секреты, handoff ─────────────────────────────
-step "Ссылки, QR и памятка"
-PANEL_URL="https://$PUBIP:$PANEL_PORT$PANEL_PATH"
-PATH_ENC="$(jq -rn --arg v "$VLESS_PATH" '$v|@uri')"
-: > "$CLIENTS_TXT"
-echo "$PEOPLE" | jq -r '.[]|"\(.name) \(.uuid) \(.sub)"' | while read -r nm uid sub; do
-  LA="vless://${uid}@${PUBIP}:${VLESS_PORT}?type=xhttp&path=${PATH_ENC}&mode=auto&security=reality&encryption=none&pbk=${REALITY_PUBLIC_KEY}&fp=chrome&sni=${SNI_DONOR}&sid=${REALITY_SHORT_ID}&spx=%2F#${nm}-XHTTP"
-  LB=""; [ "$ENABLE_BACKUP" = "1" ] && LB="vless://${uid}@${PUBIP}:${VISION_PORT}?type=tcp&security=reality&encryption=none&flow=xtls-rprx-vision&pbk=${REALITY_PUBLIC_KEY}&fp=chrome&sni=${SNI_DONOR}&sid=${REALITY_SHORT_ID}&spx=%2F#${nm}-Vision"
-  SUBURL=""; [ "$ENABLE_SUB" = "1" ] && SUBURL="https://${PUBIP}:${SUB_PORT}${SUB_PATH}${sub}"
-  { echo "### $nm"; echo "A (основной): $LA"; [ -n "$LB" ] && echo "B (резерв):   $LB"; [ -n "$SUBURL" ] && echo "Подписка (1 ссылка = оба канала): $SUBURL"; echo; } >> "$CLIENTS_TXT"
-  qrencode -o "$WORKDIR/${nm}_A_qr.png" -s 6 -m 2 "$LA" 2>/dev/null || true
-  [ -n "$LB" ]     && qrencode -o "$WORKDIR/${nm}_B_qr.png"   -s 6 -m 2 "$LB" 2>/dev/null || true
-  [ -n "$SUBURL" ] && qrencode -o "$WORKDIR/${nm}_sub_qr.png" -s 6 -m 2 "$SUBURL" 2>/dev/null || true
-done
-chmod 600 "$CLIENTS_TXT"
+# ───────────────────────────── 11. Self-test ─────────────────────────────
+step "Self-test"
+systemctl is-active --quiet x-ui && ok "x-ui активен" || warn "x-ui не активен"
+ss -tlnp | grep -q ":$VLESS_PORT " && ok "TCP :$VLESS_PORT слушается" || warn "нет TCP :$VLESS_PORT"
+ss -ulnp | grep -q ":$AWG_PORT " && ok "UDP :$AWG_PORT слушается" || warn "нет UDP :$AWG_PORT"
+# VLESS прогон трафика (первый клиент)
+U1="$(echo "$PEOPLE" | jq -r '.[0].uuid')"
+cat > "$WORKDIR/.probe.json" <<PJ
+{"log":{"loglevel":"error"},"inbounds":[{"listen":"127.0.0.1","port":10991,"protocol":"socks","settings":{"udp":true}}],
+"outbounds":[{"protocol":"vless","settings":{"vnext":[{"address":"$PUBIP","port":$VLESS_PORT,"users":[{"id":"$U1","encryption":"none","flow":"xtls-rprx-vision"}]}]},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"serverName":"$SNI_DONOR","publicKey":"$REALITY_PUBLIC_KEY","shortId":"$REALITY_SHORT_ID","fingerprint":"chrome","spiderX":"/"}}}]}
+PJ
+"$XRAYBIN" run -c "$WORKDIR/.probe.json" >/dev/null 2>&1 & PP=$!; sleep 5
+[ "$(curl -s --max-time 12 --socks5-hostname 127.0.0.1:10991 https://api.ipify.org 2>/dev/null)" = "$PUBIP" ] && ok "VLESS прогон трафика OK" || warn "VLESS прогон не прошёл"
+kill "$PP" 2>/dev/null || true; rm -f "$WORKDIR/.probe.json"
+if [ "$CHECK_RUSSIA" = "1" ]; then
+  rid=$(curl -s -m10 -H "Accept: application/json" "https://check-host.net/check-tcp?host=${PUBIP}:$VLESS_PORT&node=ru1.node.check-host.net&node=msk.node.check-host.net" | jq -r '.request_id // empty')
+  [ -n "$rid" ] && { sleep 12; echo "  доступ из РФ (порт $VLESS_PORT):"; curl -s -m10 -H "Accept: application/json" "https://check-host.net/check-result/$rid" | jq -r 'to_entries[]|"      \(.key|split(".")[0]): "+(if .value==null then "wait" elif (.value[0].error) then "BLOCK" elif (.value[0].time) then "OK "+((.value[0].time*1000)|floor|tostring)+"ms" else "?" end)"'; }
+fi
 
+# ───────────────────────────── 12. Секреты + handoff ─────────────────────────────
+step "Сохранение секретов и памятки"
 umask 077
 cat > "$SECRETS" <<EOF
 PANEL_PORT=$PANEL_PORT
@@ -324,39 +336,34 @@ PANEL_PATH_RAW=$PANEL_PATH_RAW
 PANEL_USER=$PANEL_USER
 PANEL_PASS=$PANEL_PASS
 SNI_DONOR=$SNI_DONOR
+VLESS_PORT=$VLESS_PORT
 REALITY_PRIVATE_KEY=$REALITY_PRIVATE_KEY
 REALITY_PUBLIC_KEY=$REALITY_PUBLIC_KEY
 REALITY_SHORT_ID=$REALITY_SHORT_ID
-VLESS_PATH=$VLESS_PATH
-VLESS_PORT=$VLESS_PORT
-VISION_PORT=$VISION_PORT
+AWG_PORT=$AWG_PORT
+AWG_SUBNET=$AWG_SUBNET
+AWG_SRV_PRIV=$AWG_SRV_PRIV
 SUB_PORT=$SUB_PORT
+AGG_PORT=$AGG_PORT
 CLIENTS_JSON='$PEOPLE'
 EOF
 chmod 600 "$SECRETS"
-FIRST_NAME="$(echo "$PEOPLE" | jq -r '.[0].name')"
-FIRST_SUB="$(echo "$PEOPLE" | jq -r '.[0].sub')"
 {
   echo "# VPN handoff ($PUBIP)"; echo
-  echo "Панель:  $PANEL_URL"; echo "Логин:   $PANEL_USER"; echo "Пароль:  $PANEL_PASS"
-  echo "Xray-core: $XRAY_VER · 3x-ui: $XUI_VERSION · донор: $SNI_DONOR"; echo
-  echo "Каналы: A=VLESS+XHTTP+Reality TCP/$VLESS_PORT (основной) · B=VLESS+Reality+TCP+Vision TCP/$VISION_PORT (резерв)"
-  echo "Клиенты связаны на обоих каналах (один UUID+subId)."
-  [ "$ENABLE_SUB" = "1" ] && echo "Подписка (1 ссылка = оба канала): https://$PUBIP:$SUB_PORT${SUB_PATH}<subId>"
-  echo "Ссылки и QR: $CLIENTS_TXT, $WORKDIR/*_qr.png"
-  echo "Требования к клиенту: ядро Xray >= 26.x; fp=chrome (уже в ссылках). Канал B совместим почти со всем."
-} > "$HANDOFF"
-chmod 600 "$HANDOFF"
-ok "сохранено: $HANDOFF · $CLIENTS_TXT · $SECRETS"
+  echo "Панель:  https://$PUBIP:$PANEL_PORT$PANEL_PATH"; echo "Логин:   $PANEL_USER"; echo "Пароль:  $PANEL_PASS"; echo
+  echo "VLESS: Reality+Vision TCP/$VLESS_PORT, донор $SNI_DONOR (Xray $XRAY_VER)"
+  echo "AmneziaWG 2.0: UDP/$AWG_PORT, подсеть $AWG_SUBNET.0/24"
+  echo "Персональные страницы (QR + оба конфига):"
+  echo "$PEOPLE" | jq -r --arg ip "$PUBIP" --arg ap "$AGG_PORT" '.[]|"  \(.name): https://\($ip):\($ap)/p/\(.sub)"'
+} > "$HANDOFF"; chmod 600 "$HANDOFF"
+ok "сохранено: $SECRETS · $HANDOFF"
 
-# ───────────────────────────── 12. Итог ─────────────────────────────
+# ───────────────────────────── 13. Итог ─────────────────────────────
 echo -e "\n${C_G}════════════════════════════════════════════════════════════════${C_N}"
-echo -e "${C_G}  ГОТОВО. VPN развёрнут и проверен (2 канала VLESS+Reality).${C_N}"
+echo -e "${C_G}  ГОТОВО. VLESS+Reality+Vision и AmneziaWG 2.0 развёрнуты ($NP клиентов).${C_N}"
 echo -e "${C_G}════════════════════════════════════════════════════════════════${C_N}"
-echo -e "${C_B}Панель:${C_N} $PANEL_URL\n${C_B}Логин:${C_N}  $PANEL_USER   ${C_B}Пароль:${C_N} $PANEL_PASS"
-echo -e "\n${C_B}Клиенты и ссылки:${C_N} $CLIENTS_TXT (+ QR в $WORKDIR/*_qr.png)"
-[ "$ENABLE_SUB" = "1" ] && echo -e "${C_B}Подписка $FIRST_NAME (1 ссылка = оба канала):${C_N} https://$PUBIP:$SUB_PORT${SUB_PATH}${FIRST_SUB}"
-echo -e "\n${C_B}QR подписки $FIRST_NAME (скан = оба канала):${C_N}"
-if [ "$ENABLE_SUB" = "1" ]; then qrencode -t ANSIUTF8 "https://$PUBIP:$SUB_PORT${SUB_PATH}${FIRST_SUB}"; fi
-echo -e "${C_Y}Памятка: $HANDOFF · Версии: Xray $XRAY_VER · 3x-ui $XUI_VERSION${C_N}"
+echo -e "${C_B}Панель:${C_N} https://$PUBIP:$PANEL_PORT$PANEL_PATH  ${C_B}логин/пароль:${C_N} $PANEL_USER / $PANEL_PASS"
+echo -e "\n${C_B}Персональные ссылки раздачи (один линк = AWG для Amnezia + VLESS для Hiddify/роутера):${C_N}"
+echo "$PEOPLE" | jq -r --arg ip "$PUBIP" --arg ap "$AGG_PORT" '.[]|"  \(.name): https://\($ip):\($ap)/p/\(.sub)"'
+echo -e "\n${C_Y}Секреты: $SECRETS · Памятка: $HANDOFF${C_N}"
 echo -e "${C_Y}Те же клиенты на другом сервере: запусти с CLIENTS_JSON из $SECRETS${C_N}\n"
