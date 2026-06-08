@@ -266,7 +266,10 @@ table inet filter {
         iifname "awg0" accept
         oifname "awg0" ct state established,related accept
     }
-    chain output { type filter hook output priority filter; policy accept; $SMTP_RULE }
+    chain output {
+        type filter hook output priority filter; policy accept;
+        $SMTP_RULE
+    }
 }
 table inet nat {
     chain postrouting {
