@@ -10,16 +10,16 @@
 #    • панель 3x-ui (фикс. версия = Xray-core 26.6.1)
 #    • хардинг: случайный путь/порт/логин/пароль, HTTPS (LE для IP или self-signed)
 #    • Канал A: VLESS + XHTTP + Reality (TCP/443) — основной, стелс
-#    • Канал B: VLESS + Reality + TCP + Vision (TCP/8443) — резерв, максимальная
-#               совместимость (роутеры, старые клиенты); стабилен после рестартов
-#    • КЛИЕНТЫ создаются сразу СВЯЗАННЫМИ на обоих каналах (один UUID + один subId)
+#    • Канал B: VLESS + Reality + TCP + Vision (TCP/8443) — резерв, совместимость
+#    • КЛИЕНТЫ создаются связанными на обоих каналах (один UUID + один subId)
+#    • ПОДПИСКА: одна ссылка/QR на человека = оба канала (авто-обновление)
 #    • фаервол nftables (deny-by-default, SSH-safe, блок исходящего SMTP)
-#    • самопроверка: реальный прогон трафика через ОБА канала для каждого клиента
+#    • самопроверка: прогон трафика через ОБА канала для каждого клиента
 #    • опционально: проверка доступности из России (check-host.net)
-#    • выдаёт в консоль доступ к панели + готовые ссылки/QR
 #
-#  Почему не Hysteria2: встроенный в Xray hy2-inbound нестабилен (баг #5921 —
-#  перестаёт отвечать после рестарта Xray). Два VLESS+Reality канала надёжнее.
+#  Несколько серверов с ОДИНАКОВЫМИ клиентами (для одной общей подписки):
+#    на 1-м сервере возьми CLIENTS_JSON из /root/vpn-setup/secrets.env и запусти
+#    им же на остальных:  CLIENTS_JSON='[...]' bash <(curl -fsSL .../install.sh)
 #
 #  Запуск:  bash <(curl -fsSL https://raw.githubusercontent.com/denis-ne-normis/server-init/main/install.sh)
 #  Несколько клиентов:  CLIENTS="denis vlad liza parents" bash <(curl -fsSL ...)
@@ -33,7 +33,9 @@ SNI_DONOR="${SNI_DONOR:-www.microsoft.com}"   # донор Reality (TLS1.3+H2+X2
 VLESS_PORT="${VLESS_PORT:-443}"               # Канал A: VLESS+XHTTP+Reality (TCP)
 VISION_PORT="${VISION_PORT:-8443}"            # Канал B: VLESS+Reality+TCP+Vision
 PANEL_PORT="${PANEL_PORT:-}"                    # порт панели; пусто => случайный
-CLIENTS="${CLIENTS:-client-1}"                 # список клиентов через пробел (создаются на ОБОИХ каналах, связанные)
+CLIENTS="${CLIENTS:-client-1}"                 # список клиентов через пробел (на ОБОИХ каналах, связанные)
+SUB_PORT="${SUB_PORT:-2096}"                    # порт подписки 3x-ui
+ENABLE_SUB="${ENABLE_SUB:-1}"                  # 1 = открыть порт подписки и выдавать sub-ссылки
 ENABLE_BACKUP="${ENABLE_BACKUP:-1}"            # 1 = поднять резервный канал B (Vision)
 BLOCK_SMTP="${BLOCK_SMTP:-1}"                   # 1 = блокировать исходящий SMTP (анти-абуз)
 CHECK_RUSSIA="${CHECK_RUSSIA:-1}"              # 1 = проверить доступность портов из РФ (check-host.net)
@@ -46,6 +48,7 @@ HANDOFF="/root/vpn-handoff.md"
 LOG="/var/log/vpn-install.log"
 XRAY_FLOOR_MAJOR=26
 INSTALL_SH="https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh"
+SUB_PATH="/sub/"
 # ────────────────────────────────────────────────────────────────────────────────
 
 C_G='\033[0;32m'; C_Y='\033[0;33m'; C_R='\033[0;31m'; C_B='\033[0;34m'; C_N='\033[0m'
@@ -143,8 +146,12 @@ if [ -z "${REALITY_PRIVATE_KEY:-}" ] || [ -z "${REALITY_PUBLIC_KEY:-}" ]; then
 fi
 REALITY_SHORT_ID="${REALITY_SHORT_ID:-$(openssl rand -hex 8)}"
 VLESS_PATH="${VLESS_PATH:-/api/v1/$(openssl rand -hex 4)}"
-# PEOPLE: [{name,uuid,sub}] — один UUID и один subId на человека = связь обоих каналов.
+# PEOPLE: [{name,uuid,sub}] — один UUID + один subId на человека = связь обоих каналов.
 PEOPLE="${CLIENTS_JSON:-[]}"
+# Одинаковые клиенты на всех серверах: если передан CLIENTS_JSON, берём список людей из него.
+if [ "$CLIENTS" = "client-1" ] && [ "$(echo "$PEOPLE" | jq 'length')" -gt 0 ]; then
+  CLIENTS="$(echo "$PEOPLE" | jq -r '[.[].name]|join(" ")')"
+fi
 for name in $CLIENTS; do
   if ! echo "$PEOPLE" | jq -e --arg n "$name" 'any(.[]?; .name==$n)' >/dev/null 2>&1; then
     PEOPLE="$(echo "$PEOPLE" | jq -c --arg n "$name" --arg u "$("$XRAYBIN" uuid)" --arg s "$(gen_alnum 24 16)" '. + [{name:$n,uuid:$u,sub:$s}]')"
@@ -191,6 +198,11 @@ api_post() { local c; c=$(curl -sk -b "$CK" "$BASE/csrf-token" | jq -r '.obj // 
 api_get()  { curl -sk -b "$CK" "$BASE$1"; }
 inbound_exists() { api_get "/panel/api/inbounds/list" | jq -e --arg r "$1" '.obj[]?|select(.remark==$r)' >/dev/null 2>&1; }
 step "Авторизация в панели (API)"; api_login || die "не удалось залогиниться в панель API"; ok "API-сессия установлена"
+# настройки подписки (порт/путь) из панели
+SUBINFO="$(api_post "/panel/setting/all" "" 2>/dev/null || echo '{}')"
+SP="$(echo "$SUBINFO" | jq -r '.obj.subPort // empty')"; [ -n "$SP" ] && SUB_PORT="$SP"
+SPATH="$(echo "$SUBINFO" | jq -r '.obj.subPath // empty')"; [ -n "$SPATH" ] && SUB_PATH="$SPATH"
+[ "$(echo "$SUBINFO" | jq -r '.obj.subEnable // false')" = "true" ] || warn "подписка в панели выключена — включи в Панель→Настройки→Подписка"
 
 REALITY_JSON="$(jq -cn --arg priv "$REALITY_PRIVATE_KEY" --arg pub "$REALITY_PUBLIC_KEY" --arg sid "$REALITY_SHORT_ID" --arg donor "$SNI_DONOR" \
   '{show:false,dest:($donor+":443"),xver:0,serverNames:[$donor],privateKey:$priv,shortIds:["",$sid],settings:{publicKey:$pub,fingerprint:"chrome",spiderX:"/"}}')"
@@ -224,6 +236,7 @@ else warn "резервный канал B отключён (ENABLE_BACKUP=0)"; 
 step "Фаервол nftables (deny-by-default, SSH-safe)"
 SMTP_RULE=""; [ "$BLOCK_SMTP" = "1" ] && SMTP_RULE='tcp dport { 25, 465, 587 } reject with icmp type admin-prohibited'
 BACKUP_RULE=""; [ "$ENABLE_BACKUP" = "1" ] && BACKUP_RULE="tcp dport $VISION_PORT accept"
+SUB_RULE="";    [ "$ENABLE_SUB" = "1" ]    && SUB_RULE="tcp dport $SUB_PORT accept"
 cat > /etc/nftables.conf <<NFT
 #!/usr/sbin/nft -f
 flush ruleset
@@ -239,6 +252,7 @@ table inet filter {
         tcp dport $PANEL_PORT accept
         tcp dport $VLESS_PORT accept
         $BACKUP_RULE
+        $SUB_RULE
     }
     chain forward { type filter hook forward priority filter; policy drop; }
     chain output {
@@ -259,7 +273,6 @@ step "Проверка доступности"
 systemctl is-active --quiet x-ui && ok "сервис x-ui активен" || die "x-ui не активен"
 ss -tlnp | grep -q ":$VLESS_PORT " && ok "TCP :$VLESS_PORT слушается (канал A)" || die "нет TCP :$VLESS_PORT"
 [ "$ENABLE_BACKUP" = "1" ] && { ss -tlnp | grep -q ":$VISION_PORT " && ok "TCP :$VISION_PORT слушается (канал B)" || warn "нет TCP :$VISION_PORT"; }
-# сквозной прогон каждого клиента через оба канала
 probe() { # $1=uuid $2=port $3=net(xhttp|tcp)
   local cfg="$WORKDIR/.probe.json" got
   if [ "$3" = "xhttp" ]; then
@@ -279,7 +292,6 @@ echo "$PEOPLE" | jq -r '.[]|"\(.name) \(.uuid)"' | while read -r nm uid; do
   if [ "$ENABLE_BACKUP" = "1" ]; then probe "$uid" "$VISION_PORT" tcp && b="B✅" || b="B❌"; else b="B-"; fi
   ok "клиент $nm: $a $b"
 done
-# доступность из России (опционально)
 if [ "$CHECK_RUSSIA" = "1" ]; then
   ru_check() { local rid; rid=$(curl -s -m10 -H "Accept: application/json" "https://check-host.net/check-tcp?host=${PUBIP}:$1&node=ru1.node.check-host.net&node=ru2.node.check-host.net&node=ru3.node.check-host.net" | jq -r '.request_id // empty')
     [ -z "$rid" ] && { warn "check-host недоступен"; return; }; sleep 12
@@ -293,12 +305,14 @@ step "Ссылки, QR и памятка"
 PANEL_URL="https://$PUBIP:$PANEL_PORT$PANEL_PATH"
 PATH_ENC="$(jq -rn --arg v "$VLESS_PATH" '$v|@uri')"
 : > "$CLIENTS_TXT"
-echo "$PEOPLE" | jq -r '.[]|"\(.name) \(.uuid)"' | while read -r nm uid; do
+echo "$PEOPLE" | jq -r '.[]|"\(.name) \(.uuid) \(.sub)"' | while read -r nm uid sub; do
   LA="vless://${uid}@${PUBIP}:${VLESS_PORT}?type=xhttp&path=${PATH_ENC}&mode=auto&security=reality&encryption=none&pbk=${REALITY_PUBLIC_KEY}&fp=chrome&sni=${SNI_DONOR}&sid=${REALITY_SHORT_ID}&spx=%2F#${nm}-XHTTP"
   LB=""; [ "$ENABLE_BACKUP" = "1" ] && LB="vless://${uid}@${PUBIP}:${VISION_PORT}?type=tcp&security=reality&encryption=none&flow=xtls-rprx-vision&pbk=${REALITY_PUBLIC_KEY}&fp=chrome&sni=${SNI_DONOR}&sid=${REALITY_SHORT_ID}&spx=%2F#${nm}-Vision"
-  { echo "### $nm"; echo "A (основной): $LA"; [ -n "$LB" ] && echo "B (резерв):   $LB"; echo; } >> "$CLIENTS_TXT"
+  SUBURL=""; [ "$ENABLE_SUB" = "1" ] && SUBURL="https://${PUBIP}:${SUB_PORT}${SUB_PATH}${sub}"
+  { echo "### $nm"; echo "A (основной): $LA"; [ -n "$LB" ] && echo "B (резерв):   $LB"; [ -n "$SUBURL" ] && echo "Подписка (1 ссылка = оба канала): $SUBURL"; echo; } >> "$CLIENTS_TXT"
   qrencode -o "$WORKDIR/${nm}_A_qr.png" -s 6 -m 2 "$LA" 2>/dev/null || true
-  [ -n "$LB" ] && qrencode -o "$WORKDIR/${nm}_B_qr.png" -s 6 -m 2 "$LB" 2>/dev/null || true
+  [ -n "$LB" ]     && qrencode -o "$WORKDIR/${nm}_B_qr.png"   -s 6 -m 2 "$LB" 2>/dev/null || true
+  [ -n "$SUBURL" ] && qrencode -o "$WORKDIR/${nm}_sub_qr.png" -s 6 -m 2 "$SUBURL" 2>/dev/null || true
 done
 chmod 600 "$CLIENTS_TXT"
 
@@ -316,16 +330,20 @@ REALITY_SHORT_ID=$REALITY_SHORT_ID
 VLESS_PATH=$VLESS_PATH
 VLESS_PORT=$VLESS_PORT
 VISION_PORT=$VISION_PORT
+SUB_PORT=$SUB_PORT
 CLIENTS_JSON='$PEOPLE'
 EOF
 chmod 600 "$SECRETS"
 FIRST_NAME="$(echo "$PEOPLE" | jq -r '.[0].name')"
+FIRST_SUB="$(echo "$PEOPLE" | jq -r '.[0].sub')"
 {
   echo "# VPN handoff ($PUBIP)"; echo
   echo "Панель:  $PANEL_URL"; echo "Логин:   $PANEL_USER"; echo "Пароль:  $PANEL_PASS"
   echo "Xray-core: $XRAY_VER · 3x-ui: $XUI_VERSION · донор: $SNI_DONOR"; echo
   echo "Каналы: A=VLESS+XHTTP+Reality TCP/$VLESS_PORT (основной) · B=VLESS+Reality+TCP+Vision TCP/$VISION_PORT (резерв)"
-  echo "Клиенты связаны на обоих каналах (один UUID+subId). Ссылки и QR: $CLIENTS_TXT, $WORKDIR/*_qr.png"
+  echo "Клиенты связаны на обоих каналах (один UUID+subId)."
+  [ "$ENABLE_SUB" = "1" ] && echo "Подписка (1 ссылка = оба канала): https://$PUBIP:$SUB_PORT${SUB_PATH}<subId>"
+  echo "Ссылки и QR: $CLIENTS_TXT, $WORKDIR/*_qr.png"
   echo "Требования к клиенту: ядро Xray >= 26.x; fp=chrome (уже в ссылках). Канал B совместим почти со всем."
 } > "$HANDOFF"
 chmod 600 "$HANDOFF"
@@ -337,6 +355,8 @@ echo -e "${C_G}  ГОТОВО. VPN развёрнут и проверен (2 к�
 echo -e "${C_G}════════════════════════════════════════════════════════════════${C_N}"
 echo -e "${C_B}Панель:${C_N} $PANEL_URL\n${C_B}Логин:${C_N}  $PANEL_USER   ${C_B}Пароль:${C_N} $PANEL_PASS"
 echo -e "\n${C_B}Клиенты и ссылки:${C_N} $CLIENTS_TXT (+ QR в $WORKDIR/*_qr.png)"
-echo -e "\n${C_B}QR первого клиента ($FIRST_NAME), основной канал:${C_N}"
-qrencode -t ANSIUTF8 "$(echo "$PEOPLE" | jq -r --arg ip "$PUBIP" --arg path "$PATH_ENC" --arg pub "$REALITY_PUBLIC_KEY" --arg sid "$REALITY_SHORT_ID" --arg d "$SNI_DONOR" --argjson vp "$VLESS_PORT" '.[0]|"vless://\(.uuid)@\($ip):\($vp)?type=xhttp&path=\($path)&mode=auto&security=reality&encryption=none&pbk=\($pub)&fp=chrome&sni=\($d)&sid=\($sid)&spx=%2F#\(.name)-XHTTP"')"
-echo -e "${C_Y}Памятка: $HANDOFF · Версии: Xray $XRAY_VER · 3x-ui $XUI_VERSION${C_N}\n"
+[ "$ENABLE_SUB" = "1" ] && echo -e "${C_B}Подписка $FIRST_NAME (1 ссылка = оба канала):${C_N} https://$PUBIP:$SUB_PORT${SUB_PATH}${FIRST_SUB}"
+echo -e "\n${C_B}QR подписки $FIRST_NAME (скан = оба канала):${C_N}"
+if [ "$ENABLE_SUB" = "1" ]; then qrencode -t ANSIUTF8 "https://$PUBIP:$SUB_PORT${SUB_PATH}${FIRST_SUB}"; fi
+echo -e "${C_Y}Памятка: $HANDOFF · Версии: Xray $XRAY_VER · 3x-ui $XUI_VERSION${C_N}"
+echo -e "${C_Y}Те же клиенты на другом сервере: запусти с CLIENTS_JSON из $SECRETS${C_N}\n"
