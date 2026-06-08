@@ -1,0 +1,10 @@
+# ⚠️ НЕ коммитить секреты/выдачу конкретного сервера в публичный репозиторий!
+vpn-handoff.md
+secrets.env
+*.env
+*_qr.png
+*_qr.txt
+*_link.txt
+reality_keys.txt
+.cookies
+*.log
