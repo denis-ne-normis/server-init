@@ -326,8 +326,10 @@ PJ
 [ "$(curl -s --max-time 12 --socks5-hostname 127.0.0.1:10991 https://api.ipify.org 2>/dev/null)" = "$PUBIP" ] && ok "VLESS прогон трафика OK" || warn "VLESS прогон не прошёл"
 kill "$PP" 2>/dev/null || true; rm -f "$WORKDIR/.probe.json"
 if [ "$CHECK_RUSSIA" = "1" ]; then
-  rid=$(curl -s -m10 -H "Accept: application/json" "https://check-host.net/check-tcp?host=${PUBIP}:$VLESS_PORT&node=ru1.node.check-host.net&node=msk.node.check-host.net" | jq -r '.request_id // empty')
-  [ -n "$rid" ] && { sleep 12; echo "  доступ из РФ (порт $VLESS_PORT):"; curl -s -m10 -H "Accept: application/json" "https://check-host.net/check-result/$rid" | jq -r 'to_entries[]|"      \(.key|split(".")[0]): "+(if .value==null then "wait" elif (.value[0].error) then "BLOCK" elif (.value[0].time) then "OK "+((.value[0].time*1000)|floor|tostring)+"ms" else "?" end)"'; }
+  { rid=$(curl -s -m10 -H "Accept: application/json" "https://check-host.net/check-tcp?host=${PUBIP}:$VLESS_PORT&node=ru1.node.check-host.net&node=msk.node.check-host.net" | jq -r '.request_id // empty')
+    if [ -n "$rid" ]; then sleep 12; echo "  доступ из РФ (порт $VLESS_PORT):"
+      curl -s -m10 -H "Accept: application/json" "https://check-host.net/check-result/$rid" | jq -r 'to_entries[]|"      \(.key|split(".")[0]): \(if .value==null then "wait" elif (.value[0].error) then "BLOCK" elif (.value[0].time) then "OK \((.value[0].time*1000)|floor)ms" else "?" end)"' || true
+    fi; } || true
 fi
 
 # ───────────────────────────── 12. Секреты + handoff ─────────────────────────────
