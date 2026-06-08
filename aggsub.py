@@ -62,11 +62,11 @@ ol{text-align:left;color:#c7cbe0;font-size:14px;line-height:1.55;padding-left:18
 <h1>VPN — %(n)s</h1><div class=muted>сервер <b>%(lbl)s</b> · твои личные конфиги, никому не пересылай</div>
 <div class=card><span class="tag t1">ОСНОВНОЙ</span><h2>Amnezia (AmneziaWG)</h2>
 <ol><li>Установи приложение <b>AmneziaVPN</b> (внизу ссылки).</li>
-<li>Нажми <b>«Открыть в Amnezia»</b> — ключ импортируется сам. Или отсканируй QR в приложении («+» → «QR-код»). Или скачай файл.</li>
+<li>Скопируй ключ ниже → в приложении «+» → «Вставьте ключ» → «Продолжить». Или скачай файлом.</li>
 <li>Нажми «Подключиться».</li></ol>
-<a class="b g" href="%(vpn)s">Открыть в Amnezia (1 тап)</a>
-%(aqr)s
-<a class="b g2" href="/awg/%(sub)s" download>Скачать файлом (запас)</a>
+<textarea id=a readonly>%(vpn)s</textarea>
+<button class=c onclick="navigator.clipboard.writeText(document.getElementById('a').value);this.textContent='Скопировано ✓'">Скопировать ключ</button>
+<a class="b g2" href="/awg/%(sub)s" download>Скачать файлом</a>
 <div class=store><a href="https://play.google.com/store/apps/details?id=org.amnezia.vpn">Android</a> · <a href="https://apps.apple.com/app/id1600529900">iPhone</a> · <a href="https://amnezia.org/downloads">ПК</a></div></div>
 <div class=card><span class="tag t2">РЕЗЕРВ / РОУТЕР</span><h2>Hiddify (VLESS Reality)</h2>
 <ol><li>Установи <b>Hiddify</b> (внизу), включи Xray-core в настройках.</li>

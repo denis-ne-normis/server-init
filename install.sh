@@ -340,7 +340,6 @@ for f in glob.glob(CLd+"/*.conf"):
     raw=json.dumps(outer,ensure_ascii=False).encode()
     key="vpn://"+base64.urlsafe_b64encode(struct.pack(">I",len(raw))+zlib.compress(raw,9)).decode().rstrip("=")
     open(DIST+"/"+name+".vpn","w").write(key)
-    subprocess.run(["qrencode","-s","8","-m","2","-o",QRd+"/"+name+".png",key])
 PYAWG
 curl -fsSL "https://raw.githubusercontent.com/denis-ne-normis/server-init/${REPO_REF}/aggsub.py" -o /root/aggsub.py 2>/dev/null || cp "$WORKDIR/aggsub.py" /root/aggsub.py 2>/dev/null || true
 if [ ! -f /root/aggsub.py ]; then warn "aggsub.py не найден в репозитории — страницы /p будут недоступны (см. README)"; else
