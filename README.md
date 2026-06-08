@@ -14,12 +14,12 @@
 - **Самопроверка**: реально прогоняет трафик через прокси и подтверждает работу.
 - **На выходе в консоли**: ссылка на панель, логин/пароль, готовые ссылки и QR клиента.
 
-## Установка (один command)
+## Установка (одной командой)
 
 На **чистом** Ubuntu 24.04 / Debian 12 (root, amd64):
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/<ВАШ_ЛОГИН>/<РЕПО>/main/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/denis-ne-normis/server-init/main/install.sh)
 ```
 
 Через 2–3 минуты в консоли появятся доступы к панели и QR-код основного канала. Готово.
@@ -33,7 +33,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/<ВАШ_ЛОГИН>/<РЕП�
 SNI_DONOR=www.twitch.tv \
 PANEL_PORT=39000 \
 ENABLE_HYSTERIA2=1 \
-bash <(curl -fsSL https://raw.githubusercontent.com/<ВАШ_ЛОГИН>/<РЕПО>/main/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/denis-ne-normis/server-init/main/install.sh)
 ```
 
 | Переменная | По умолчанию | Описание |
