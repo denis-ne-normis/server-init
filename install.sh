@@ -90,7 +90,7 @@ ok "донор: $SNI_DONOR · порт VLESS: $VLESS_PORT · порт AWG(UDP): 
 step "Зависимости"
 apt-get update -y >>"$LOG" 2>&1
 apt-get -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" upgrade >>"$LOG" 2>&1
-apt-get install -y curl wget jq qrencode openssl ca-certificates nftables socat dnsutils uuid-runtime software-properties-common >>"$LOG" 2>&1
+apt-get install -y curl wget jq qrencode openssl ca-certificates nftables socat dnsutils uuid-runtime software-properties-common sqlite3 >>"$LOG" 2>&1
 for c in curl jq qrencode openssl nft; do require "$c"; done
 ok "базовые зависимости установлены"
 # AmneziaWG
@@ -168,19 +168,20 @@ ok "клиентов: $NP ($(echo "$PEOPLE" | jq -r '[.[].name]|join(", ")'))"
 
 # ───────────────────────────── 6. Хардинг панели ─────────────────────────────
 step "Хардинг панели + HTTPS"
+XUI_DB="/etc/x-ui/x-ui.db"
 "$XUIBIN" setting -username "$PANEL_USER" -password "$PANEL_PASS" -port "$PANEL_PORT" -webBasePath "$PANEL_PATH_RAW" >>"$LOG" 2>&1
-CERT_LINE="$("$XUIBIN" setting -getCert 2>/dev/null || true)"
-PANEL_CERT="$(echo "$CERT_LINE" | grep -i 'cert:' | awk '{print $2}')"
-PANEL_KEY="$(echo  "$CERT_LINE" | grep -i 'key:'  | awk '{print $2}')"
-if [ -z "$PANEL_CERT" ] || [ ! -f "$PANEL_CERT" ]; then
+# В 3x-ui 3.2.8 CLI -webCert НЕ сохраняет cert (не создаёт ключи в БД) → пишем webCertFile/webKeyFile напрямую в БД.
+EXISTING_CERT="$(sqlite3 "$XUI_DB" "SELECT value FROM settings WHERE key='webCertFile';" 2>/dev/null || true)"
+if [ -z "$EXISTING_CERT" ] || [ ! -f "$EXISTING_CERT" ]; then
   mkdir -p /root/cert/panel
   openssl req -x509 -nodes -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -days 3650 \
     -keyout /root/cert/panel/private.key -out /root/cert/panel/cert.crt \
     -subj "/CN=$PUBIP" -addext "subjectAltName=IP:$PUBIP" >>"$LOG" 2>&1
   PANEL_CERT=/root/cert/panel/cert.crt; PANEL_KEY=/root/cert/panel/private.key
-  "$XUIBIN" setting -webCert "$PANEL_CERT" -webCertKey "$PANEL_KEY" >>"$LOG" 2>&1
-  ok "self-signed сертификат панели"
-else ok "сертификат панели: $PANEL_CERT"; fi
+  systemctl stop x-ui 2>/dev/null || true
+  sqlite3 "$XUI_DB" "DELETE FROM settings WHERE key IN ('webCertFile','webKeyFile'); INSERT INTO settings (key,value) VALUES ('webCertFile','$PANEL_CERT'),('webKeyFile','$PANEL_KEY');"
+  ok "self-signed сертификат панели (HTTPS)"
+else PANEL_CERT="$EXISTING_CERT"; PANEL_KEY="$(sqlite3 "$XUI_DB" "SELECT value FROM settings WHERE key='webKeyFile';" 2>/dev/null)"; ok "сертификат панели: $PANEL_CERT"; fi
 systemctl enable x-ui >>"$LOG" 2>&1 || true; systemctl restart x-ui; sleep 2
 PANEL_PORT="$("$XUIBIN" setting -show 2>/dev/null | grep -i '^port' | awk '{print $2}')"
 PANEL_PATH="$("$XUIBIN" setting -show 2>/dev/null | grep -i 'webBasePath' | awk '{print $2}')"
