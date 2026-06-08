@@ -11,8 +11,9 @@
 - **Канал B — VLESS + Reality + TCP + Vision** (TCP/8443): резерв на другом транспорте и порту. «Классический» Reality — **максимально совместим** (роутеры, старые клиенты) и стабилен после рестартов. Один клиент работает по обоим каналам — если по основному где-то затык, переключаетесь на резерв.
 - **Сетевой тюнинг**: BBR + `fq`, увеличенные буферы — «чтобы летало».
 - **Фаервол nftables**: deny-by-default, SSH-safe, блок исходящего SMTP (анти-абуз).
-- **Самопроверка**: реально прогоняет трафик через ОБА канала и подтверждает работу.
-- **На выходе в консоли**: ссылка на панель, логин/пароль, готовые ссылки и QR обоих каналов.
+- **Клиенты** создаются сразу на обоих каналах и **связаны** (один UUID + общий `subId`); список задаётся переменной `CLIENTS`.
+- **Самопроверка**: прогон трафика через ОБА канала для каждого клиента + (опц.) проверка доступности портов из России.
+- **На выходе в консоли**: ссылка на панель, логин/пароль, ссылки и QR клиентов.
 
 > **Почему не Hysteria2?** Встроенный в Xray hy2-inbound оказался нестабильным (баг ядра #5921 — перестаёт отвечать после рестарта Xray). Два VLESS+Reality канала на разных транспортах/портах дают надёжное резервирование без этого бага и покрывают те же сценарии.
 
@@ -31,7 +32,11 @@ bash <(curl -fsSL https://raw.githubusercontent.com/denis-ne-normis/server-init/
 Параметры задаются переменными окружения перед запуском.
 
 ```bash
-# пример: задать донора и фикс. порт панели
+# несколько клиентов сразу (создаются на обоих каналах и связываются):
+CLIENTS="denis vlad liza parents" \
+bash <(curl -fsSL https://raw.githubusercontent.com/denis-ne-normis/server-init/main/install.sh)
+
+# другие параметры: донор Reality и фикс. порт панели
 SNI_DONOR=www.twitch.tv PANEL_PORT=39000 \
 bash <(curl -fsSL https://raw.githubusercontent.com/denis-ne-normis/server-init/main/install.sh)
 ```
@@ -44,7 +49,8 @@ bash <(curl -fsSL https://raw.githubusercontent.com/denis-ne-normis/server-init/
 | `PANEL_PORT` | случайный | Порт веб-панели |
 | `ENABLE_BACKUP` | `1` | `0` — не поднимать резервный канал B |
 | `BLOCK_SMTP` | `1` | `0` — не блокировать исходящий SMTP |
-| `FIRST_CLIENT` | `client-1` | Имя первого клиента |
+| `CLIENTS` | `client-1` | Список клиентов через пробел; каждый создаётся на обоих каналах и связывается (общий `subId`). Пример: `"denis vlad liza"` |
+| `CHECK_RUSSIA` | `1` | `0` — не проверять доступность портов из РФ (check-host.net) |
 | `XUI_VERSION` | `v3.2.8` | Версия панели (пусто = последняя) |
 | `FORCE_REINSTALL` | `0` | `1` — переустановить панель поверх существующей |
 
@@ -61,7 +67,8 @@ bash <(curl -fsSL https://raw.githubusercontent.com/denis-ne-normis/server-init/
 
 - `/root/vpn-handoff.md` — памятка: доступы, ссылки, требования к клиенту.
 - `/root/vpn-setup/secrets.env` — все секреты (chmod 600).
-- `/root/vpn-setup/channelA_qr.png`, `channelB_qr.png` — QR-коды каналов.
+- `/root/vpn-setup/clients.txt` — ссылки всех клиентов (оба канала).
+- `/root/vpn-setup/<имя>_A_qr.png`, `<имя>_B_qr.png` — QR по клиенту и каналу.
 - `/var/log/vpn-install.log` — лог установки.
 
 ## Повторный запуск
