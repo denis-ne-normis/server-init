@@ -169,7 +169,11 @@ def main():
     if snapshot() != before:
         raise RuntimeError('bootstrap changed identity bytes')
     note('PASS complete TLS continuation: real panel API, AWG systemd, rootless HTTPS, subscriptions, Xray traffic probe')
+    if vpnctl.firewall_mode() != 'baseline':
+        raise RuntimeError('fresh install did not leave the safe persistent firewall baseline')
+    command(['systemctl', 'is-enabled', '--quiet', 'nftables'])
     command(['/usr/local/bin/vpnctl', 'doctor', '--pre-firewall'])
+    note('PASS fresh install persists lockout-safe AWG NAT before inbound firewall hardening')
     command(['/usr/local/bin/vpnctl', 'repair'])
     if snapshot() != before:
         raise RuntimeError('repeat repair changed identities')
@@ -187,6 +191,10 @@ def main():
     command(['ip', '-n', 'awg-integration', 'addr', 'add', client['ip'] + '/32', 'dev', 'awg-ci'])
     command(['ip', '-n', 'awg-integration', 'link', 'set', 'awg-ci', 'up'])
     command(['ip', '-n', 'awg-integration', 'route', 'add', '10.9.7.1/32', 'dev', 'awg-ci'])
+    command(['ip', '-n', 'awg-integration', 'route', 'add', 'default', 'dev', 'awg-ci'])
+    resolver = Path('/etc/netns/awg-integration/resolv.conf')
+    resolver.parent.mkdir(parents=True, exist_ok=True)
+    resolver.write_text('nameserver 1.1.1.1\nnameserver 8.8.8.8\n')
     (TEMP / 'test.txt').write_text('awg-roundtrip-ok\n')
     http = subprocess.Popen(['/usr/bin/python3', '-m', 'http.server', '18080', '--bind', '10.9.7.1', '--directory', str(TEMP)], stdout=output, stderr=output)
     children.append(http)
@@ -194,7 +202,18 @@ def main():
     result = command(['ip','netns','exec','awg-integration','curl','-fsS','--retry','3','--max-time','15','http://10.9.7.1:18080/test.txt'])
     if result.stdout.strip() != 'awg-roundtrip-ok':
         raise RuntimeError('AWG data round trip failed')
-    note('PASS real AWG client handshake and encrypted HTTP transfer in network namespace')
+    result = command(['ip','netns','exec','awg-integration','curl','-4fsS','--max-time','25','https://api.ipify.org'])
+    if result.stdout.strip() != ip:
+        raise RuntimeError('fresh-install baseline NAT did not provide Internet egress')
+    command(['nft', 'flush', 'ruleset'])
+    command(['systemctl', 'restart', 'nftables'])
+    if vpnctl.firewall_mode() != 'baseline':
+        raise RuntimeError('nftables restart did not restore the persistent baseline')
+    result = command(['ip','netns','exec','awg-integration','curl','-4fsS','--max-time','25','https://api.ipify.org'])
+    if result.stdout.strip() != ip:
+        raise RuntimeError('AWG Internet egress failed after nftables restart')
+    command(['/usr/local/bin/vpnctl', 'doctor', '--pre-firewall'])
+    note('PASS AWG client Internet through baseline NAT; nftables restart restores it without VPN/key changes')
     command(['systemctl', 'restart', 'awg-quick@awg0', 'aggsub', 'x-ui'])
     time.sleep(3)
     command(['/usr/local/bin/vpnctl', 'doctor', '--pre-firewall'])
