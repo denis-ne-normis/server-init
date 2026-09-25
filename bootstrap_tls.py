@@ -69,8 +69,7 @@ def usable_pair(cert, key, ip, ca_file=None, min_seconds=86400):
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.load_cert_chain(cert, key)
         for args in (['openssl', 'x509', '-in', cert, '-noout', '-checkend', str(min_seconds)],
-                     ['openssl', 'x509', '-in', cert, '-noout', '-checkip', ip],
-                     ['openssl', 'verify', '-purpose', 'sslserver'] +
+                     ['openssl', 'verify', '-purpose', 'sslserver', '-verify_ip', ip] +
                      (['-CAfile', ca_file] if ca_file else []) + ['-untrusted', cert, cert]):
             if vpnctl.run(args, check=False).returncode:
                 return False

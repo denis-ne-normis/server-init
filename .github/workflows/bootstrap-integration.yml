@@ -15,6 +15,12 @@ jobs:
           persist-credentials: false
       - name: Real ACME, panel, Xray, kernel AWG and recovery
         run: sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,RUNNER_TEMP,GITHUB_WORKSPACE /usr/bin/python3 tests/integration_bootstrap.py
+      - name: Make only redacted reports readable by artifact uploader
+        if: always()
+        run: |
+          for file in integration-results.txt integration-diagnostics.txt; do
+            if [ -f "$file" ]; then sudo chmod 0644 "$file"; fi
+          done
       - name: Collect redacted integration evidence only
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
