@@ -38,6 +38,8 @@ DATA = Path("/var/lib/vpn-dist")
 ETC = Path("/etc/vpn-dist")
 FW = Path("/run/server-init-firewall")
 NFT_CONF = Path("/etc/nftables.conf")
+BOOTSTRAP_NAT = ETC / "bootstrap-nat.nft"
+CONFIRMED_FIREWALL_MARKER = "# server-init confirmed firewall"
 NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\Z")
 TOKEN = re.compile(r"[A-Za-z0-9_-]{16,128}\Z")
 
@@ -494,6 +496,18 @@ OnUnitActiveSec=2min
 [Install]
 WantedBy=timers.target
 """)
+    install_unit("vpn-awg-bootstrap-nat.service", """[Unit]
+Description=Keep AWG NAT available until restrictive firewall is confirmed
+After=nftables.service network-online.target
+Wants=network-online.target
+Before=awg-quick@awg0.service
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/vpnctl firewall-prime-runtime
+RemainAfterExit=yes
+[Install]
+WantedBy=multi-user.target
+""")
     if "/cert/le/" in settings["webCertFile"]:
         install_unit("vpn-cert-renew.service", """[Unit]
 Description=Renew short-lived IP certificate before expiry
@@ -581,6 +595,50 @@ def cert_renew(state):
     print("IP certificate renewed. AWG was not restarted; panel/VLESS may reconnect briefly.")
 
 
+def firewall_bootstrap_text(state, wan):
+    """Minimal persistent NAT. It never adds an input/forward drop policy."""
+    validate_state(state)
+    if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,15}", wan):
+        raise ValueError("invalid WAN interface")
+    return f'''#!/usr/sbin/nft -f
+# server-init bootstrap NAT: connectivity only, no inbound filtering.
+table inet server_init {{
+ chain postrouting {{
+  type nat hook postrouting priority srcnat; policy accept;
+  ip saddr {state['AWG_SUBNET']}.0/24 oifname "{wan}" masquerade
+ }}
+}}
+'''
+
+
+def firewall_prime_runtime():
+    """Re-create bootstrap NAT at boot unless the restrictive firewall is confirmed."""
+    if (FW / "pending.json").exists():
+        return
+    if NFT_CONF.is_file() and CONFIRMED_FIREWALL_MARKER in NFT_CONF.read_text():
+        return
+    if not BOOTSTRAP_NAT.is_file():
+        raise ValueError("bootstrap NAT file missing")
+    run(["nft", "delete", "table", "inet", "server_init"], check=False)
+    run(["nft", "-f", BOOTSTRAP_NAT])
+
+
+def firewall_prime(state):
+    """Persist AWG NAT before the risky input firewall transaction."""
+    if (FW / "pending.json").exists():
+        raise ValueError("firewall confirmation/rollback already pending")
+    if NFT_CONF.is_file() and CONFIRMED_FIREWALL_MARKER in NFT_CONF.read_text():
+        print("Restrictive firewall already confirmed; bootstrap NAT is not needed.")
+        return
+    route = json.loads(run(["ip", "-j", "-4", "route", "get", "1.1.1.1"]).stdout)[0]
+    text = firewall_bootstrap_text(state, route["dev"])
+    atomic(BOOTSTRAP_NAT, text, 0o644)
+    run(["nft", "-c", "-f", BOOTSTRAP_NAT])
+    run(["systemctl", "enable", "vpn-awg-bootstrap-nat.service"])
+    run(["systemctl", "restart", "vpn-awg-bootstrap-nat.service"])
+    print("Persistent AWG bootstrap NAT enabled. It does not restrict inbound SSH or other ports.")
+
+
 def firewall_text(state, wan, ssh_ports):
     validate_state(state)
     if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,15}", wan):
@@ -590,6 +648,7 @@ def firewall_text(state, wan, ssh_ports):
         raise ValueError("invalid listening port")
     smtp = 'tcp dport { 25, 465, 587 } reject with icmpx type admin-prohibited' if state.get("BLOCK_SMTP", "1") == "1" else ""
     return f'''#!/usr/sbin/nft -f
+{CONFIRMED_FIREWALL_MARKER}
 flush ruleset
 # Dedicated VPN host only. Apply with a rollback timer, then confirm via NEW SSH.
 table inet server_init {{
@@ -669,9 +728,13 @@ def firewall_apply(state, replace=False):
     except Exception:
         firewall_rollback()
         raise
-    print("Firewall is TEMPORARY. Open a NEW SSH connection, then run:")
-    print(f'sudo env SSH_CONNECTION="$SSH_CONNECTION" vpnctl firewall-confirm {token}')
-    print("Without confirmation, previous live rules are restored after 180 seconds. Disk config is unchanged.")
+    server_port = int(connection.split()[3])
+    remote = (f'env SSH_CONNECTION="$SSH_CONNECTION" vpnctl firewall-confirm {token} '
+              '&& vpnctl doctor && cat /root/vpn-handoff.md')
+    print("Firewall hardening is TEMPORARY. AWG bootstrap NAT is already persistent.")
+    print("ON YOUR COMPUTER, open a NEW terminal and run this single command:")
+    print(f"ssh -p {server_port} -o ControlPath=none root@{state['PANEL_HOST']} {shlex.quote(remote)}")
+    print("If you do nothing for 180 seconds, only the restrictive firewall rolls back; AWG NAT remains available.")
 
 
 def firewall_rollback(token=""):
@@ -764,12 +827,35 @@ def doctor(state, pre_firewall=False):
     from awg_upgrade import network_issues
     try:
         issues = network_issues(state)
-        for issue in issues:
-            print(f"{'WARN' if pre_firewall else 'FAIL'} {issue}")
-        if not issues:
-            print("OK managed AWG NAT, forwarding and UDP input for active WAN")
-        elif not pre_firewall:
-            errors += 1
+        if pre_firewall:
+            expected = {
+                "expected AWG forwarding rule missing for active WAN",
+                "expected AWG UDP input rule missing",
+                "persistent firewall configuration missing",
+            }
+            unexpected = [issue for issue in issues if issue not in expected]
+            primed = (BOOTSTRAP_NAT.is_file() and
+                      run(["systemctl", "is-enabled", "--quiet", "vpn-awg-bootstrap-nat.service"],
+                          check=False).returncode == 0)
+            if primed and not unexpected:
+                print("OK persistent AWG bootstrap NAT; restrictive input firewall is not confirmed yet")
+            else:
+                for issue in unexpected:
+                    print(f"WARN {issue}")
+                if not primed:
+                    print("WARN persistent AWG bootstrap NAT is not enabled")
+        else:
+            for issue in issues:
+                print(f"FAIL {issue}")
+            if not issues:
+                print("OK managed AWG NAT, forwarding and UDP input for active WAN")
+            else:
+                primed = (BOOTSTRAP_NAT.is_file() and
+                          run(["systemctl", "is-enabled", "--quiet", "vpn-awg-bootstrap-nat.service"],
+                              check=False).returncode == 0)
+                if primed:
+                    print("INFO AWG NAT fallback is persistent, but restrictive firewall hardening is not confirmed.")
+                errors += 1
     except (OSError, ValueError, KeyError, RuntimeError):
         print(f"{'WARN' if pre_firewall else 'FAIL'} unable to inspect AWG NAT/firewall")
         if not pre_firewall:
@@ -780,7 +866,7 @@ def doctor(state, pre_firewall=False):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["repair", "doctor", "backup", "recover", "awg-start", "awg-stop", "cert-renew", "cert-deploy", "firewall-apply", "firewall-confirm", "firewall-rollback", "validate", "awg-upgrade", "awg-rollback"])
+    parser.add_argument("command", choices=["repair", "doctor", "backup", "recover", "awg-start", "awg-stop", "cert-renew", "cert-deploy", "firewall-prime", "firewall-prime-runtime", "firewall-apply", "firewall-confirm", "firewall-rollback", "validate", "awg-upgrade", "awg-rollback"])
     parser.add_argument("token", nargs="?", default="")
     parser.add_argument("--replace-firewall", action="store_true")
     parser.add_argument("--pre-firewall", action="store_true", help="bootstrap-only: NAT not applied yet")
@@ -789,7 +875,7 @@ def main():
     if os.geteuid() != 0:
         parser.error("run as root")
     # Nested systemd start/stop and acme deploy hooks must not reacquire parent locks.
-    unlocked = {"doctor", "validate", "awg-start", "awg-stop", "cert-deploy"}
+    unlocked = {"doctor", "validate", "awg-start", "awg-stop", "cert-deploy", "firewall-prime-runtime"}
     lock = None
     if args.command not in unlocked:
         lock_path = "/run/server-init-firewall.lock" if args.command.startswith("firewall-") else "/run/server-init.lock"
@@ -804,6 +890,8 @@ def main():
     if args.command in {"awg-upgrade", "awg-rollback"}:
         import awg_upgrade
         (awg_upgrade.upgrade if args.command == "awg-upgrade" else awg_upgrade.rollback)()
+    elif args.command == "firewall-prime-runtime":
+        firewall_prime_runtime()
     elif args.command == "awg-start":
         awg_start()
     elif args.command == "awg-stop":
@@ -826,6 +914,8 @@ def main():
             return doctor(state, args.pre_firewall)
         elif args.command == "cert-renew":
             cert_renew(state)
+        elif args.command == "firewall-prime":
+            firewall_prime(state)
         elif args.command == "firewall-apply":
             firewall_apply(state, args.replace_firewall)
     return 0
