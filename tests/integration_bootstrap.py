@@ -216,8 +216,11 @@ def main():
     note('PASS AWG client Internet through baseline NAT; nftables restart restores it without VPN/key changes')
     command(['systemctl', 'restart', 'awg-quick@awg0', 'aggsub', 'x-ui'])
     time.sleep(3)
+    result = command(['ip','netns','exec','awg-integration','curl','-4fsS','--retry','3','--max-time','25','https://api.ipify.org'])
+    if result.stdout.strip() != ip:
+        raise RuntimeError('AWG Internet egress failed after server service restart')
     command(['/usr/local/bin/vpnctl', 'doctor', '--pre-firewall'])
-    note('PASS service restart and post-restart health; no reboot or mobile-ISP test claimed')
+    note('PASS nftables + AWG/service restarts retain Internet egress; no full host reboot or mobile-ISP test claimed')
     import integration_awg31
     integration_awg31.exercise(sys.modules[__name__], bundle)
 
