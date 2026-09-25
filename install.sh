@@ -153,6 +153,10 @@ step 'Install hardened distributor and systemd-managed AWG'
 # vpnctl takes the same lock; all identity/config writes above are now complete.
 flock -u 9
 python3 "$HERE/vpnctl.py" repair
+if [[ "${APPLY_FIREWALL:-1}" == 1 ]]; then
+  step 'Persist AWG bootstrap NAT (safe: no inbound ports are restricted)'
+  vpnctl firewall-prime
+fi
 step 'Local health checks'
 sleep 2
 vpnctl doctor --pre-firewall
@@ -198,7 +202,8 @@ PY
 if [[ "${APPLY_FIREWALL:-1}" == 1 ]]; then
   step 'Apply temporary firewall; confirmation from a NEW SSH connection is required'
   vpnctl firewall-apply --replace-firewall
-  printf '\nVPN local tests passed. Firewall is NOT persistent until confirmation. Read /root/vpn-handoff.md for private access details.\n'
+  printf '\nVPN local tests passed. AWG NAT is already persistent. Restrictive firewall hardening is NOT persistent until confirmation.\n'
+  printf 'Copy the single ssh command printed above into a NEW terminal on your computer; it confirms the firewall, runs doctor and prints your private access links.\n'
 else
   printf '\nWARN: firewall explicitly skipped. This host is not hardened for public use.\n'
 fi
