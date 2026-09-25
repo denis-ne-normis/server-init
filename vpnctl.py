@@ -581,17 +581,57 @@ def cert_renew(state):
     print("IP certificate renewed. AWG was not restarted; panel/VLESS may reconnect briefly.")
 
 
-def firewall_text(state, wan, ssh_ports):
-    validate_state(state)
+def _validate_wan(wan):
     if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,15}", wan):
         raise ValueError("invalid WAN interface")
+
+
+def firewall_base_text(state, wan):
+    """Persistent AWG connectivity that cannot lock out SSH.
+
+    This intentionally leaves INPUT/FORWARD policy ACCEPT. It provides the
+    masquerade AWG needs, explicit AWG forwarding and SMTP abuse protection.
+    The separate hardened transaction may later change INPUT/FORWARD to DROP.
+    """
+    validate_state(state)
+    _validate_wan(wan)
+    smtp = 'tcp dport { 25, 465, 587 } reject with icmpx type admin-prohibited' if state.get("BLOCK_SMTP", "1") == "1" else ""
+    return f'''#!/usr/sbin/nft -f
+flush ruleset
+# Safe persistent baseline: VPN connectivity survives hardening rollback/reboot.
+# INPUT/FORWARD remain permissive here, so this file cannot lock out SSH.
+table inet server_init {{
+ chain input {{
+  type filter hook input priority filter; policy accept;
+  udp dport {state['AWG_PORT']} accept
+ }}
+ chain forward {{
+  type filter hook forward priority filter; policy accept;
+  {('iifname "awg0" ' + smtp) if smtp else ''}
+  iifname "awg0" oifname "{wan}" ip saddr {state['AWG_SUBNET']}.0/24 accept
+ }}
+ chain output {{
+  type filter hook output priority filter; policy accept;
+  {smtp}
+ }}
+ chain postrouting {{
+  type nat hook postrouting priority srcnat; policy accept;
+  ip saddr {state['AWG_SUBNET']}.0/24 oifname "{wan}" masquerade
+ }}
+}}
+'''
+
+
+def firewall_text(state, wan, ssh_ports):
+    validate_state(state)
+    _validate_wan(wan)
     ports = sorted(set(int(p) for p in ssh_ports) | {80, int(state["PANEL_PORT"]), int(state["VLESS_PORT"]), int(state["AGG_PORT"])})
     if any(not 1 <= port <= 65535 for port in ports):
         raise ValueError("invalid listening port")
     smtp = 'tcp dport { 25, 465, 587 } reject with icmpx type admin-prohibited' if state.get("BLOCK_SMTP", "1") == "1" else ""
     return f'''#!/usr/sbin/nft -f
 flush ruleset
-# Dedicated VPN host only. Apply with a rollback timer, then confirm via NEW SSH.
+# Hardened dedicated VPN host. Apply transactionally, confirm from NEW external SSH.
 table inet server_init {{
  chain input {{
   type filter hook input priority filter; policy drop;
@@ -619,6 +659,47 @@ table inet server_init {{
  }}
 }}
 '''
+
+
+def firewall_mode():
+    result = run(["nft", "-j", "list", "table", "inet", "server_init"], check=False)
+    if result.returncode:
+        return "missing"
+    try:
+        objects = json.loads(result.stdout)["nftables"]
+    except (json.JSONDecodeError, KeyError, TypeError):
+        return "unknown"
+    policies = {}
+    for obj in objects:
+        chain = obj.get("chain", {})
+        if chain.get("name") in {"input", "forward"}:
+            policies[chain["name"]] = chain.get("policy")
+    pair = (policies.get("input"), policies.get("forward"))
+    if pair == ("accept", "accept"):
+        return "baseline"
+    if pair == ("drop", "drop"):
+        return "hardened"
+    return "unknown"
+
+
+def firewall_base_apply(state):
+    """Install reboot-persistent AWG NAT before any lock-out-capable firewall."""
+    mode = firewall_mode()
+    if mode == "hardened":
+        print("Hardened firewall already active; persistent AWG connectivity unchanged.")
+        return
+    if mode not in {"missing", "baseline"}:
+        raise ValueError("unexpected server_init firewall layout; refusing automatic replacement")
+    route = json.loads(run(["ip", "-j", "-4", "route", "get", "1.1.1.1"]).stdout)[0]
+    FW.mkdir(mode=0o700, exist_ok=True)
+    candidate = FW / "baseline.nft"
+    text = firewall_base_text(state, route["dev"])
+    atomic(candidate, text)
+    run(["nft", "-c", "-f", candidate])
+    run(["nft", "-f", candidate])
+    atomic(NFT_CONF, text, 0o600)
+    run(["systemctl", "enable", "nftables"])
+    print("Persistent AWG NAT installed. VPN connectivity now survives reboot and firewall-hardening rollback.")
 
 
 def require_external_ssh(connection):
@@ -671,7 +752,7 @@ def firewall_apply(state, replace=False):
         raise
     print("Firewall is TEMPORARY. Open a NEW SSH connection, then run:")
     print(f'sudo env SSH_CONNECTION="$SSH_CONNECTION" vpnctl firewall-confirm {token}')
-    print("Without confirmation, previous live rules are restored after 180 seconds. Disk config is unchanged.")
+    print("Without confirmation, previous live rules are restored after 180 seconds; persistent disk config is unchanged.")
 
 
 def firewall_rollback(token=""):
@@ -768,6 +849,17 @@ def doctor(state, pre_firewall=False):
             print(f"{'WARN' if pre_firewall else 'FAIL'} {issue}")
         if not issues:
             print("OK managed AWG NAT, forwarding and UDP input for active WAN")
+            mode = firewall_mode()
+            if mode == "hardened":
+                print("OK hardened inbound firewall is active")
+            elif mode == "baseline":
+                print("WARN inbound firewall hardening is not confirmed; VPN/NAT remain persistent and functional")
+                if not pre_firewall:
+                    errors += 1
+            else:
+                print(f"{'WARN' if pre_firewall else 'FAIL'} unable to classify inbound firewall mode")
+                if not pre_firewall:
+                    errors += 1
         elif not pre_firewall:
             errors += 1
     except (OSError, ValueError, KeyError, RuntimeError):
@@ -778,21 +870,51 @@ def doctor(state, pre_firewall=False):
     return min(errors, 1)
 
 
+
+def print_handoff():
+    path = Path("/root/vpn-handoff.md")
+    if not path.is_file() or path.is_symlink():
+        raise ValueError("private handoff file missing")
+    print("\n===== PRIVATE VPN ACCESS DETAILS =====")
+    print(path.read_text().rstrip())
+    print("\nRaw client files: /root/vpn-setup/dist/<name>.vpn and <name>.vless")
+    print("Do not paste private vpn:// keys, panel password or backup archives into public chats/issues.")
+
+
+def finish(state):
+    """Confirm a pending hardened firewall from the second external SSH session."""
+    pending_file = FW / "pending.json"
+    if pending_file.exists():
+        pending = json.loads(pending_file.read_text())
+        firewall_confirm(pending["token"])
+    mode = firewall_mode()
+    if mode != "hardened":
+        raise ValueError(
+            "VPN/NAT are persistent, but the hardening window expired. "
+            "Run: env SSH_CONNECTION=\"$SSH_CONNECTION\" vpnctl firewall-apply --replace-firewall ; "
+            "then open one more NEW terminal on your computer and run: vpnctl finish"
+        )
+    if doctor(state):
+        raise RuntimeError("post-install health check failed; inspect the FAIL lines above")
+    print_handoff()
+
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["repair", "doctor", "backup", "recover", "awg-start", "awg-stop", "cert-renew", "cert-deploy", "firewall-apply", "firewall-confirm", "firewall-rollback", "validate", "awg-upgrade", "awg-rollback"])
+    parser.add_argument("command", choices=["repair", "doctor", "backup", "recover", "awg-start", "awg-stop", "cert-renew", "cert-deploy", "firewall-base", "firewall-apply", "firewall-confirm", "firewall-rollback", "finish", "handoff", "validate", "awg-upgrade", "awg-rollback"])
     parser.add_argument("token", nargs="?", default="")
     parser.add_argument("--replace-firewall", action="store_true")
-    parser.add_argument("--pre-firewall", action="store_true", help="bootstrap-only: NAT not applied yet")
+    parser.add_argument("--pre-firewall", action="store_true", help="bootstrap-only: hardened inbound firewall may not be confirmed yet")
     args = parser.parse_args()
     os.umask(0o077)
     if os.geteuid() != 0:
         parser.error("run as root")
     # Nested systemd start/stop and acme deploy hooks must not reacquire parent locks.
-    unlocked = {"doctor", "validate", "awg-start", "awg-stop", "cert-deploy"}
+    unlocked = {"doctor", "validate", "awg-start", "awg-stop", "cert-deploy", "handoff"}
     lock = None
     if args.command not in unlocked:
-        lock_path = "/run/server-init-firewall.lock" if args.command.startswith("firewall-") else "/run/server-init.lock"
+        lock_path = "/run/server-init-firewall.lock" if args.command.startswith("firewall-") or args.command == "finish" else "/run/server-init.lock"
         lock = open(lock_path, "a")
         try:
             flags = fcntl.LOCK_EX if args.command == "firewall-rollback" else fcntl.LOCK_EX | fcntl.LOCK_NB
@@ -812,6 +934,8 @@ def main():
         firewall_rollback(args.token)
     elif args.command == "firewall-confirm":
         firewall_confirm(args.token)
+    elif args.command == "handoff":
+        print_handoff()
     elif args.command == "recover":
         recover()
     elif args.command == "backup":
@@ -826,8 +950,12 @@ def main():
             return doctor(state, args.pre_firewall)
         elif args.command == "cert-renew":
             cert_renew(state)
+        elif args.command == "firewall-base":
+            firewall_base_apply(state)
         elif args.command == "firewall-apply":
             firewall_apply(state, args.replace_firewall)
+        elif args.command == "finish":
+            finish(state)
     return 0
 
 
