@@ -1,0 +1,26 @@
+name: Real bootstrap integration
+on:
+  pull_request:
+  push:
+    branches: [main, 'fix/vpn-reliability-tls-*']
+permissions:
+  contents: read
+jobs:
+  integration:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Real ACME, panel, Xray, kernel AWG and recovery
+        run: sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,RUNNER_TEMP,GITHUB_WORKSPACE /usr/bin/python3 tests/integration_bootstrap.py
+      - name: Collect redacted integration evidence only
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: bootstrap-integration
+          retention-days: 7
+          path: |
+            integration-results.txt
+            integration-diagnostics.txt
