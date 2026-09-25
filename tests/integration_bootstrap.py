@@ -77,7 +77,7 @@ def redact_log():
         for value in sorted(fields, key=len, reverse=True):
             if len(value) >= 8:
                 text = text.replace(value, '[redacted-test-value]')
-    text = re.sub(r'(?m)^.*(?:PrivateKey|PresharedKey|Password|password|private.key|--token|Account key).*$','[redacted]',text)
+    text = re.sub(r'(?m)^.*(?:HeaderProtectionKey|PrivateKey|PresharedKey|Password|password|private.key|--token|Account key).*$','[redacted]',text)
     # No snapshots, keys, config files or private raw logs are uploaded.
     (SOURCE / 'integration-diagnostics.txt').write_text(text[-35000:])
 
@@ -158,7 +158,7 @@ def main():
         raise RuntimeError(f'expected actual acme.sh skip exit 2, got {skipped.returncode}')
     note('PASS reproduced original false failure: already-issued certificate returns exit 2')
     # Prepare exactly the user's point of interruption: identities saved, no inbound.
-    env.update(PUBIP=ip, CLIENTS='integration', PANEL_PORT='39000', APPLY_FIREWALL='0', ENABLE_LE='1')
+    env.update(AWG_PROTOCOL='2', PUBIP=ip, CLIENTS='integration', PANEL_PORT='39000', APPLY_FIREWALL='0', ENABLE_LE='1')
     command(['/usr/bin/python3', SOURCE / 'provision.py'], env=env)
     before = snapshot()
     result = command(['bash', SOURCE / 'install.sh', '--resume-from-tls'], env=env, check=False)
@@ -169,7 +169,7 @@ def main():
     if snapshot() != before:
         raise RuntimeError('bootstrap changed identity bytes')
     note('PASS complete TLS continuation: real panel API, AWG systemd, rootless HTTPS, subscriptions, Xray traffic probe')
-    command(['/usr/local/bin/vpnctl', 'doctor'])
+    command(['/usr/local/bin/vpnctl', 'doctor', '--pre-firewall'])
     command(['/usr/local/bin/vpnctl', 'repair'])
     if snapshot() != before:
         raise RuntimeError('repeat repair changed identities')
@@ -197,8 +197,11 @@ def main():
     note('PASS real AWG client handshake and encrypted HTTP transfer in network namespace')
     command(['systemctl', 'restart', 'awg-quick@awg0', 'aggsub', 'x-ui'])
     time.sleep(3)
-    command(['/usr/local/bin/vpnctl', 'doctor'])
+    command(['/usr/local/bin/vpnctl', 'doctor', '--pre-firewall'])
     note('PASS service restart and post-restart health; no reboot or mobile-ISP test claimed')
+    import integration_awg31
+    integration_awg31.exercise(sys.modules[__name__], bundle)
+
 
 
 if __name__ == '__main__':

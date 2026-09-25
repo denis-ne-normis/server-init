@@ -21,7 +21,7 @@ jobs:
       - name: Python and Bash syntax
         run: |
           /usr/bin/python3 --version
-          /usr/bin/python3 -m py_compile aggsub.py vpnctl.py provision.py
+          /usr/bin/python3 -m py_compile aggsub.py vpnctl.py provision.py awg_profile.py awg_upgrade.py
           bash -n install.sh
       - name: Regression tests (no host mutations)
         shell: bash

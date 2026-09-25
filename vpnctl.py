@@ -6,6 +6,7 @@ Do not share backups: they contain private keys. Linux/systemd is required for
 maintenance commands; pure parsers/renderers are covered by unit tests.
 """
 import argparse
+import awg_profile
 import base64
 import contextlib
 import fcntl
@@ -104,6 +105,7 @@ def people_from(state):
 
 def validate_state(state):
     people_from(state)
+    awg_profile.version(state)
     tcp = [int(state[key]) for key in ("PANEL_PORT", "VLESS_PORT", "SUB_PORT", "AGG_PORT")]
     if len(set(tcp)) != len(tcp) or any(not 1 <= p <= 65535 for p in tcp):
         raise ValueError("TCP ports must be distinct and between 1 and 65535")
@@ -167,8 +169,8 @@ def verify_awg(state, root=ROOT, conf=AWG_CONF, public=pubkey):
             raise ValueError("client/server key mismatch; re-import or restore correct config")
         if key32(remote["PresharedKey"]) != peer.get("PresharedKey") or local.get("Address") != peer.get("AllowedIPs"):
             raise ValueError("client PSK/address differs from server")
-        for key in ("S1", "S2", "S3", "S4", "H1", "H2", "H3", "H4"):
-            if local.get(key) != interface.get(key):
+        for key in awg_profile.MATCH_FIELDS:
+            if local.get(key, "") != interface.get(key, ""):
                 raise ValueError("AWG obfuscation mismatch")
 
 
@@ -197,15 +199,23 @@ def verify_exports(state):
                 or len(raw) > 1024 * 1024 or int.from_bytes(packed[:4], "big") != len(raw)):
             raise ValueError("invalid native Amnezia export")
         outer = json.loads(raw)
-        native = json.loads(outer["containers"][0]["awg"]["last_config"])
+        awg_meta = outer["containers"][0]["awg"]
+        native = json.loads(awg_meta["last_config"])
+        if awg_profile.version(state) == "3.1":
+            if awg_meta.get("protocol_version") != "3.1":
+                raise ValueError("native Amnezia protocol version differs from saved profile")
+            import provision
+            expected_profile = awg_profile.parameters(state, provision.OBFS)
+            if any(awg_meta.get(k) != val or native.get(k) != val for k, val in expected_profile.items()):
+                raise ValueError("native Amnezia profile metadata mismatch")
         disk = config_sections(read_file(ROOT, f"awg/clients/{name}.conf").decode())
         embedded = config_sections(native["config"])
         if [kind for kind, _ in embedded] != ["Interface", "Peer"]:
             raise ValueError("invalid embedded Amnezia configuration")
         # Legacy exports substitute DNS and may omit MTU; identity/route/obfs must agree.
-        for part, fields in ((0, ("PrivateKey", "Address", "S1", "S2", "S3", "S4", "H1", "H2", "H3", "H4", "I1")),
+        for part, fields in ((0, ("PrivateKey", "Address") + awg_profile.EXPORT_FIELDS),
                              (1, ("PublicKey", "PresharedKey", "Endpoint", "AllowedIPs"))):
-            if any(embedded[part][1].get(key) != disk[part][1].get(key) for key in fields):
+            if any(embedded[part][1].get(key, "") != disk[part][1].get(key, "") for key in fields):
                 raise ValueError("native Amnezia export differs from client config")
         if (native.get("client_priv_key") != disk[0][1]["PrivateKey"]
                 or native.get("server_pub_key") != disk[1][1]["PublicKey"]
@@ -250,6 +260,10 @@ def verify_live_awg():
     live = set(run(["awg", "show", "awg0", "peers"]).stdout.split())
     if actual != pubkey(interface["PrivateKey"]) or port != interface["ListenPort"] or peers != live:
         raise ValueError("live AWG key/port/peers differ from disk; restore consistent state explicitly")
+    if interface.get("HeaderProtectionKey"):
+        runtime = config_sections(run(["awg", "showconf", "awg0"]).stdout)[0][1]
+        if any(runtime.get(k, "") != interface.get(k, "") for k in awg_profile.MATCH_FIELDS):
+            raise ValueError("live AWG 3.1 parameters differ from saved config")
 
 
 def wait_distribution(state, cert, timeout=12):
@@ -418,7 +432,7 @@ def repair(state):
         run(["useradd", "--system", "--user-group", "--no-create-home", "--shell", "/usr/sbin/nologin", "vpn-dist"])
     LIB.mkdir(mode=0o755, parents=True, exist_ok=True)
     LIB.chmod(0o755)  # The unprivileged distributor must be able to traverse this directory.
-    for name in ("vpnctl.py", "aggsub.py"):
+    for name in ("vpnctl.py", "aggsub.py", "provision.py", "awg_profile.py", "awg_upgrade.py"):
         source = Path(__file__).resolve().parent / name
         dest = LIB / name
         if source != dest:
@@ -607,12 +621,25 @@ table inet server_init {{
 '''
 
 
+def require_external_ssh(connection):
+    parts = connection.split()
+    if len(parts) != 4:
+        raise ValueError("use an external SSH connection from your computer")
+    source = ipaddress.ip_address(parts[0])
+    local = {ipaddress.ip_address(a["local"]) for interface in json.loads(
+             run(["ip", "-j", "address", "show"]).stdout)
+             for a in interface.get("addr_info", []) if "local" in a}
+    if source.is_loopback or source.is_unspecified or source in local:
+        raise ValueError("self-SSH is not an external connectivity test; open a terminal on YOUR COMPUTER")
+
+
 def firewall_apply(state, replace=False):
     if (FW / "pending.json").exists():
         raise ValueError("firewall confirmation/rollback already pending")
     connection = os.getenv("SSH_CONNECTION", "")
     if len(connection.split()) != 4:
         raise ValueError("apply firewall over SSH so the active server port can be preserved")
+    require_external_ssh(connection)
     live = run(["nft", "list", "ruleset"]).stdout
     if live.strip() and not replace:
         raise ValueError("existing firewall found; review it before explicit --replace-firewall")
@@ -666,6 +693,7 @@ def firewall_confirm(token):
     connection = os.getenv("SSH_CONNECTION", "")
     if not secrets.compare_digest(token, pending["token"]) or len(connection.split()) != 4 or connection == pending["connection"]:
         raise ValueError("confirmation must use the printed token from a NEW SSH connection")
+    require_external_ssh(connection)
     run(["systemctl", "enable", "nftables"])
     atomic(NFT_CONF, (FW / "candidate.nft").read_text(), 0o600)
     (FW / "pending.json").unlink()
@@ -673,7 +701,7 @@ def firewall_confirm(token):
     print("Firewall confirmed and made persistent.")
 
 
-def doctor(state):
+def doctor(state, pre_firewall=False):
     errors = 0
     if (FW / "pending.json").exists():
         print("WARN firewall confirmation is pending; rules will roll back unless confirmed")
@@ -733,15 +761,29 @@ def doctor(state):
     except (OSError, ValueError, ssl.SSLError):
         print("FAIL unable to verify distributor TLS")
         errors += 1
+    from awg_upgrade import network_issues
+    try:
+        issues = network_issues(state)
+        for issue in issues:
+            print(f"{'WARN' if pre_firewall else 'FAIL'} {issue}")
+        if not issues:
+            print("OK managed AWG NAT, forwarding and UDP input for active WAN")
+        elif not pre_firewall:
+            errors += 1
+    except (OSError, ValueError, KeyError, RuntimeError):
+        print(f"{'WARN' if pre_firewall else 'FAIL'} unable to inspect AWG NAT/firewall")
+        if not pre_firewall:
+            errors += 1
     print("INFO This is a local check, not a full VPN connection test from your ISP/mobile network.")
     return min(errors, 1)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["repair", "doctor", "backup", "recover", "awg-start", "awg-stop", "cert-renew", "cert-deploy", "firewall-apply", "firewall-confirm", "firewall-rollback", "validate"])
+    parser.add_argument("command", choices=["repair", "doctor", "backup", "recover", "awg-start", "awg-stop", "cert-renew", "cert-deploy", "firewall-apply", "firewall-confirm", "firewall-rollback", "validate", "awg-upgrade", "awg-rollback"])
     parser.add_argument("token", nargs="?", default="")
     parser.add_argument("--replace-firewall", action="store_true")
+    parser.add_argument("--pre-firewall", action="store_true", help="bootstrap-only: NAT not applied yet")
     args = parser.parse_args()
     os.umask(0o077)
     if os.geteuid() != 0:
@@ -759,7 +801,10 @@ def main():
             if args.command == "recover":
                 return 0
             raise RuntimeError("another installer/maintenance operation is active")
-    if args.command == "awg-start":
+    if args.command in {"awg-upgrade", "awg-rollback"}:
+        import awg_upgrade
+        (awg_upgrade.upgrade if args.command == "awg-upgrade" else awg_upgrade.rollback)()
+    elif args.command == "awg-start":
         awg_start()
     elif args.command == "awg-stop":
         awg_stop()
@@ -778,7 +823,7 @@ def main():
         if args.command == "repair":
             repair(state)
         elif args.command == "doctor":
-            return doctor(state)
+            return doctor(state, args.pre_firewall)
         elif args.command == "cert-renew":
             cert_renew(state)
         elif args.command == "firewall-apply":

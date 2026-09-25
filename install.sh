@@ -155,7 +155,7 @@ flock -u 9
 python3 "$HERE/vpnctl.py" repair
 step 'Local health checks'
 sleep 2
-vpnctl doctor
+vpnctl doctor --pre-firewall
 step 'VLESS traffic probe (does NOT test an ISP/mobile route)'
 python3 - <<'PY'
 import json, socket
