@@ -8,12 +8,20 @@ WORKDIR=/root/vpn-setup
 LOG=/var/log/vpn-install.log
 fail() { printf '\nERROR: %s\n' "$*" >&2; exit 1; }
 step() { printf '\n==> %s\n' "$*"; }
+RESUME_BEFORE_IDENTITIES=0
+case "$*" in
+  '') ;;
+  --resume-before-identities) RESUME_BEFORE_IDENTITIES=1 ;;
+  *) fail 'Usage: bash install.sh [--resume-before-identities]' ;;
+esac
 [[ $EUID -eq 0 ]] || fail 'Run as root.'
 [[ -f "$HERE/vpnctl.py" && -f "$HERE/provision.py" && -f "$HERE/aggsub.py" ]] || fail 'Clone/download the COMPLETE repository and run bash install.sh there.'
 exec 9>/run/server-init.lock
 flock -n 9 || fail 'Another installer/maintenance operation is active.'
 # Never mutate an existing or partially installed VPN, even when secrets.env is missing.
-if [[ -e "$WORKDIR/state.json" || -e "$WORKDIR/secrets.env" || -e /etc/amnezia/amneziawg/awg0.conf || -e /etc/x-ui/x-ui.db ]]; then
+if [[ "$RESUME_BEFORE_IDENTITIES" == 1 ]]; then
+  python3 "$HERE/provision.py" --check-resume-before-identities || fail 'Resume refused. Existing files were not changed.'
+elif [[ -e "$WORKDIR/state.json" || -e "$WORKDIR/secrets.env" || -e /etc/amnezia/amneziawg/awg0.conf || -e /etc/x-ui/x-ui.db ]]; then
   fail "Existing installation detected. Nothing changed. Use: sudo python3 $HERE/vpnctl.py repair (see README for partial installations)."
 fi
 [[ ! -d /etc/pve ]] || fail 'Do not run on a Proxmox host.'
@@ -39,26 +47,33 @@ if [[ -t 0 ]]; then
 fi
 XUI_VERSION="${XUI_VERSION:-v3.2.8}"
 [[ "$XUI_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail 'Specify a release tag for XUI_VERSION; floating latest is not supported.'
-step 'Install dependencies (no full apt upgrade or automatic reboot)'
-apt-get update >>"$LOG" 2>&1
-apt-get install -y python3 curl jq qrencode openssl ca-certificates nftables socat sqlite3 software-properties-common >>"$LOG" 2>&1
+if [[ "$RESUME_BEFORE_IDENTITIES" == 0 ]]; then
+  step 'Install dependencies (no full apt upgrade or automatic reboot)'
+  apt-get update >>"$LOG" 2>&1
+  apt-get install -y python3 curl jq qrencode openssl ca-certificates nftables socat sqlite3 software-properties-common >>"$LOG" 2>&1
+  step 'Install AmneziaWG for the running kernel'
+  add-apt-repository -y ppa:amnezia/ppa >>"$LOG" 2>&1
+  apt-get update >>"$LOG" 2>&1
+  apt-get install -y "linux-headers-$(uname -r)" >>"$LOG" 2>&1
+  apt-get install -y amneziawg amneziawg-tools >>"$LOG" 2>&1
+  modprobe amneziawg
+  command -v awg >/dev/null
+  command -v awg-quick >/dev/null
+  mkdir -p "$WORKDIR"
+  chmod 700 "$WORKDIR"
+  step "Install pinned 3x-ui $XUI_VERSION"
+  curl -fLSs --connect-timeout 10 --max-time 120 --retry 2 "https://raw.githubusercontent.com/mhsanaei/3x-ui/$XUI_VERSION/install.sh" -o "$WORKDIR/xui-installer.sh"
+  bash -n "$WORKDIR/xui-installer.sh"
+  bash "$WORKDIR/xui-installer.sh" "$XUI_VERSION" </dev/null >>"$LOG" 2>&1
+  [[ -x /usr/local/x-ui/x-ui ]] || fail '3x-ui binary missing.'
+else
+  step 'Continue bootstrap before identities (packages and 3x-ui are NOT reinstalled)'
+  for tool in awg awg-quick curl jq qrencode openssl nft socat sqlite3; do
+    command -v "$tool" >/dev/null || fail "Missing dependency $tool; bootstrap cannot continue."
+  done
+fi
 export PUBIP="${PUBIP:-$(curl -fsS4 --connect-timeout 10 --max-time 20 https://api.ipify.org)}"
 python3 -c 'import ipaddress,os; ipaddress.IPv4Address(os.environ["PUBIP"])'
-step 'Install AmneziaWG for the running kernel'
-add-apt-repository -y ppa:amnezia/ppa >>"$LOG" 2>&1
-apt-get update >>"$LOG" 2>&1
-apt-get install -y "linux-headers-$(uname -r)" >>"$LOG" 2>&1
-apt-get install -y amneziawg amneziawg-tools >>"$LOG" 2>&1
-modprobe amneziawg
-command -v awg >/dev/null
-command -v awg-quick >/dev/null
-mkdir -p "$WORKDIR"
-chmod 700 "$WORKDIR"
-step "Install pinned 3x-ui $XUI_VERSION"
-curl -fLSs --connect-timeout 10 --max-time 120 --retry 2 "https://raw.githubusercontent.com/mhsanaei/3x-ui/$XUI_VERSION/install.sh" -o "$WORKDIR/xui-installer.sh"
-bash -n "$WORKDIR/xui-installer.sh"
-bash "$WORKDIR/xui-installer.sh" "$XUI_VERSION" </dev/null >>"$LOG" 2>&1
-[[ -x /usr/local/x-ui/x-ui ]] || fail '3x-ui binary missing.'
 step 'Persist all identities, then render configs (keys generated only on new installation)'
 python3 "$HERE/provision.py"
 # This is a freshly generated, safely shell-quoted file, not untrusted legacy input.
