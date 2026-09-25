@@ -144,12 +144,21 @@ class StateTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             aggsub.read_file(self.root, "escape")
 
+    def test_firewall_baseline_keeps_ssh_permissive_but_has_awg_nat(self):
+        text = vpnctl.firewall_base_text(self.bundle["settings"], "ens3")
+        self.assertEqual(text.count("policy accept;"), 4)
+        self.assertNotIn("policy drop;", text)
+        self.assertIn("udp dport 39743 accept", text)
+        self.assertIn('iifname "awg0" oifname "ens3" ip saddr 10.9.7.0/24 accept', text)
+        self.assertIn('ip saddr 10.9.7.0/24 oifname "ens3" masquerade', text)
+
     def test_firewall_preserves_custom_ssh_and_blocks_forwarded_smtp(self):
         text = vpnctl.firewall_text(self.bundle["settings"], "ens3", [2222, 22])
         self.assertIn("2222", text)
         self.assertNotIn("2096", text)  # local subscriptions do not need a public listener.
         self.assertIn('iifname "awg0" tcp dport { 25, 465, 587 } reject', text)
         self.assertIn("ip saddr 10.9.7.0/24", text)
+        self.assertIn("policy drop;", text)
 
     def test_firewall_interface_injection_rejected(self):
         with self.assertRaises(ValueError):
@@ -338,6 +347,33 @@ class HostSafetyTests(unittest.TestCase):
         with patch.object(vpnctl, "FW", self.root), patch.object(vpnctl, "run", side_effect=self.runner), patch.dict(os.environ, SSH_CONNECTION=self.connection):
             vpnctl.firewall_apply(fixture()["settings"])
         return json.loads((self.root / "pending.json").read_text())
+
+    def test_persistent_baseline_is_idempotent_and_cannot_lock_out_ssh(self):
+        def runner(args, **kwargs):
+            args = [str(x) for x in args]
+            self.calls.append(args)
+            if args[:6] == ["nft", "-j", "list", "table", "inet", "server_init"]:
+                return SimpleNamespace(returncode=1, stdout="")
+            if args[:4] == ["ip", "-j", "-4", "route"]:
+                return SimpleNamespace(returncode=0, stdout='[{"dev":"ens3"}]')
+            return SimpleNamespace(returncode=0, stdout="")
+        with patch.object(vpnctl, "FW", self.root), patch.object(vpnctl, "run", side_effect=runner):
+            vpnctl.firewall_base_apply(fixture()["settings"])
+        persisted = (self.root / "persistent.nft").read_text()
+        self.assertNotIn("policy drop;", persisted)
+        self.assertIn("masquerade", persisted)
+        self.assertIn(["systemctl", "enable", "nftables"], self.calls)
+        self.assertIn(["nft", "-f", str(self.root / "baseline.nft")], self.calls)
+
+    def test_firewall_mode_distinguishes_baseline_and_hardened(self):
+        for policy, expected in (("accept", "baseline"), ("drop", "hardened")):
+            payload = json.dumps({"nftables": [
+                {"chain": {"name": "input", "policy": policy}},
+                {"chain": {"name": "forward", "policy": policy}},
+            ]})
+            with self.subTest(policy=policy), patch.object(
+                    vpnctl, "run", return_value=SimpleNamespace(returncode=0, stdout=payload)):
+                self.assertEqual(vpnctl.firewall_mode(), expected)
 
     def test_firewall_timer_is_armed_before_apply(self):
         self.apply()
