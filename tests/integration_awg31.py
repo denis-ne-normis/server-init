@@ -136,6 +136,24 @@ def exercise(t, original):
     result = run(['ip', 'netns', 'exec', 'awg-go-test', 'curl', '-4fsS', '--max-time', '25', 'https://api.ipify.org'])
     assert result.stdout.strip() == public
     note('PASS independent AWG-Go v3 implementation with native export: kernel-server handshake, DNS and HTTPS/NAT')
+    # Keep traffic flowing through one scheduled rekey; a first handshake alone
+    # does not test the failure mode 'connects, then stops after some time'.
+    peer = original['clients'][0]['public']
+    def handshake():
+        lines = run(['awg', 'show', 'awg0', 'latest-handshakes']).stdout.splitlines()
+        return next(int(l.split()[1]) for l in lines if l.split()[0] == peer)
+    first = handshake()
+    assert first > 0
+    deadline = time.monotonic() + 190
+    while time.monotonic() < deadline:
+        time.sleep(5)
+        response = run(['ip', 'netns', 'exec', 'awg-go-test', 'curl', '-4fsS', '--max-time', '25', 'https://api.ipify.org'])
+        assert response.stdout.strip() == public
+        if handshake() > first:
+            break
+    else:
+        raise RuntimeError('AWG-Go did not complete a scheduled rekey while transmitting')
+    note('PASS AWG-Go continuous HTTPS traffic across an actual scheduled rekey')
     run(['/usr/local/bin/vpnctl', 'doctor'])
     assert run(['systemctl', 'show', 'x-ui', '-p', 'MainPID', '--value']).stdout == pid_before
     proc.terminate(); proc.wait(timeout=10)
