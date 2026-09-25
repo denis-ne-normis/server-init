@@ -328,6 +328,8 @@ class HostSafetyTests(unittest.TestCase):
         args = [str(x) for x in args]
         self.calls.append(args)
         output = ""
+        if args == ["ip", "-j", "address", "show"]:
+            output = '[{"addr_info":[{"local":"203.0.113.10"},{"local":"127.0.0.1"}]}]'
         if args[:4] == ["ip", "-j", "-4", "route"]:
             output = '[{"dev":"ens3"}]'
         return SimpleNamespace(returncode=0, stdout=output)
