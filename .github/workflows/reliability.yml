@@ -24,7 +24,10 @@ jobs:
           /usr/bin/python3 -m py_compile aggsub.py vpnctl.py provision.py
           bash -n install.sh
       - name: Regression tests (no host mutations)
-        run: /usr/bin/python3 -m unittest discover -s tests -v -b
+        shell: bash
+        run: |
+          set -o pipefail
+          /usr/bin/python3 -m unittest discover -s tests -v -b 2>&1 | tee test-results.txt
       - name: Install linters only
         run: |
           sudo apt-get update
@@ -42,3 +45,15 @@ jobs:
           Path('/tmp/server-init-test.nft').write_text(firewall_text(fixture()['settings'], 'ens3', [22, 2222]))
           PY
           sudo unshare --net nft -c -f /tmp/server-init-test.nft
+      - name: Snapshot reviewed source (tracked files only, no runtime secrets)
+        if: always()
+        run: git archive --format=tar HEAD -o review-source.tar
+      - name: Retain test evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: reliability-evidence-${{ matrix.os }}
+          retention-days: 7
+          path: |
+            review-source.tar
+            test-results.txt
