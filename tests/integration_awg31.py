@@ -23,10 +23,30 @@ def exercise(t, original):
     run, note = t.command, t.note
     state = original['settings']
     wan = json.loads(run(['ip', '-j', '-4', 'route', 'get', '1.1.1.1']).stdout)[0]['dev']
+
+    # Reproduce a clean install before firewall confirmation. The safe NAT must
+    # survive a service restart without creating any inbound drop policy.
+    run(['nft', 'flush', 'ruleset'])
+    v.firewall_prime(state)
+    assert run(['systemctl', 'is-enabled', '--quiet', 'vpn-awg-bootstrap-nat.service'], check=False).returncode == 0
+    bootstrap = run(['nft', 'list', 'table', 'inet', 'server_init']).stdout
+    assert 'masquerade' in bootstrap and 'policy drop' not in bootstrap
+    run(['nft', 'flush', 'ruleset'])
+    run(['systemctl', 'restart', 'vpn-awg-bootstrap-nat.service'])
+    bootstrap = run(['nft', 'list', 'table', 'inet', 'server_init']).stdout
+    assert 'masquerade' in bootstrap and 'policy drop' not in bootstrap
+    note('PASS unconfirmed clean install keeps persistent AWG NAT without restricting inbound SSH')
+
+    # Simulate confirmed firewall + reboot ordering: nftables restores the full
+    # ruleset first, then the bootstrap service must detect the marker and no-op.
     rules = v.firewall_text(state, wan, [22])
     v.atomic(v.NFT_CONF, rules)
-    run(['nft', '-f', v.NFT_CONF])
+    run(['systemctl', 'enable', 'nftables'])
+    run(['systemctl', 'restart', 'nftables'])
+    run(['systemctl', 'restart', 'vpn-awg-bootstrap-nat.service'])
     assert awg_upgrade.network_issues(state) == []
+    assert v.CONFIRMED_FIREWALL_MARKER in v.NFT_CONF.read_text()
+    note('PASS confirmed firewall and NAT survive reboot-order service restarts without bootstrap clobber')
     run(['ip', 'netns', 'delete', 'awg-integration'])
     nft_before = run(['nft', 'list', 'ruleset']).stdout
     pid_before = run(['systemctl', 'show', 'x-ui', '-p', 'MainPID', '--value']).stdout
