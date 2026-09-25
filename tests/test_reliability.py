@@ -146,10 +146,20 @@ class StateTests(unittest.TestCase):
 
     def test_firewall_preserves_custom_ssh_and_blocks_forwarded_smtp(self):
         text = vpnctl.firewall_text(self.bundle["settings"], "ens3", [2222, 22])
+        self.assertIn(vpnctl.CONFIRMED_FIREWALL_MARKER, text)
         self.assertIn("2222", text)
         self.assertNotIn("2096", text)  # local subscriptions do not need a public listener.
         self.assertIn('iifname "awg0" tcp dport { 25, 465, 587 } reject', text)
         self.assertIn("ip saddr 10.9.7.0/24", text)
+
+    def test_bootstrap_nat_has_no_inbound_or_forward_filter(self):
+        text = vpnctl.firewall_bootstrap_text(self.bundle["settings"], "ens3")
+        self.assertIn("ip saddr 10.9.7.0/24", text)
+        self.assertIn("masquerade", text)
+        self.assertNotIn("chain input", text)
+        self.assertNotIn("chain forward", text)
+        self.assertNotIn("policy drop", text)
+        self.assertNotIn(vpnctl.CONFIRMED_FIREWALL_MARKER, text)
 
     def test_firewall_interface_injection_rejected(self):
         with self.assertRaises(ValueError):
@@ -338,6 +348,42 @@ class HostSafetyTests(unittest.TestCase):
         with patch.object(vpnctl, "FW", self.root), patch.object(vpnctl, "run", side_effect=self.runner), patch.dict(os.environ, SSH_CONNECTION=self.connection):
             vpnctl.firewall_apply(fixture()["settings"])
         return json.loads((self.root / "pending.json").read_text())
+
+    def test_prime_nat_is_persistent_and_does_not_require_ssh(self):
+        bootstrap = self.root / "bootstrap-nat.nft"
+        with patch.object(vpnctl, "FW", self.root), patch.object(vpnctl, "BOOTSTRAP_NAT", bootstrap), patch.object(vpnctl, "run", side_effect=self.runner):
+            vpnctl.firewall_prime(fixture()["settings"])
+        self.assertTrue(bootstrap.is_file())
+        self.assertNotIn("policy drop", bootstrap.read_text())
+        self.assertIn(["systemctl", "enable", "vpn-awg-bootstrap-nat.service"], self.calls)
+        self.assertIn(["systemctl", "restart", "vpn-awg-bootstrap-nat.service"], self.calls)
+
+    def test_prime_runtime_recreates_nat_until_confirmed(self):
+        bootstrap = self.root / "bootstrap-nat.nft"
+        bootstrap.write_text(vpnctl.firewall_bootstrap_text(fixture()["settings"], "ens3"))
+        self.calls.clear()
+        with patch.object(vpnctl, "FW", self.root), patch.object(vpnctl, "BOOTSTRAP_NAT", bootstrap), patch.object(vpnctl, "run", side_effect=self.runner):
+            vpnctl.firewall_prime_runtime()
+        self.assertEqual(self.calls[0], ["nft", "delete", "table", "inet", "server_init"])
+        self.assertEqual(self.calls[1], ["nft", "-f", str(bootstrap)])
+
+    def test_prime_runtime_never_overwrites_confirmed_firewall(self):
+        bootstrap = self.root / "bootstrap-nat.nft"
+        bootstrap.write_text("bootstrap")
+        (self.root / "persistent.nft").write_text(vpnctl.CONFIRMED_FIREWALL_MARKER + "\n")
+        self.calls.clear()
+        with patch.object(vpnctl, "FW", self.root), patch.object(vpnctl, "BOOTSTRAP_NAT", bootstrap), patch.object(vpnctl, "run", side_effect=self.runner):
+            vpnctl.firewall_prime_runtime()
+        self.assertEqual(self.calls, [])
+
+    def test_prime_runtime_does_not_replace_pending_hardening(self):
+        bootstrap = self.root / "bootstrap-nat.nft"
+        bootstrap.write_text("bootstrap")
+        (self.root / "pending.json").write_text("{}")
+        self.calls.clear()
+        with patch.object(vpnctl, "FW", self.root), patch.object(vpnctl, "BOOTSTRAP_NAT", bootstrap), patch.object(vpnctl, "run", side_effect=self.runner):
+            vpnctl.firewall_prime_runtime()
+        self.assertEqual(self.calls, [])
 
     def test_firewall_timer_is_armed_before_apply(self):
         self.apply()
