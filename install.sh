@@ -153,6 +153,10 @@ step 'Install hardened distributor and systemd-managed AWG'
 # vpnctl takes the same lock; all identity/config writes above are now complete.
 flock -u 9
 python3 "$HERE/vpnctl.py" repair
+step 'Persist safe AWG connectivity before inbound firewall hardening'
+# This baseline has ACCEPT input/forward policies, so it cannot lock out SSH.
+# It makes AWG masquerade/forwarding survive reboot even if later hardening rolls back.
+vpnctl firewall-base
 step 'Local health checks'
 sleep 2
 vpnctl doctor --pre-firewall
@@ -191,14 +195,36 @@ import json,sys
 sys.path.insert(0,'/usr/local/lib/server-init')
 from vpnctl import ROOT,load_env,atomic
 s=load_env(ROOT/'secrets.env')
-text=f"# VPN handoff\nPanel: https://{s['PANEL_HOST']}:{s['PANEL_PORT']}{s['PANEL_PATH']}\nLogin: {s['PANEL_USER']}\nPassword: {s['PANEL_PASS']}\n\n"
-text+=''.join(f"{p['name']}: https://{s['PANEL_HOST']}:{s['AGG_PORT']}/p/{p['sub']}\n" for p in json.loads(s['CLIENTS_JSON']))
+people=json.loads(s['CLIENTS_JSON'])
+text=f"# VPN handoff\nPanel: https://{s['PANEL_HOST']}:{s['PANEL_PORT']}{s['PANEL_PATH']}\nLogin: {s['PANEL_USER']}\nPassword: {s['PANEL_PASS']}\n\nPersonal pages:\n"
+text+=''.join(f"{p['name']}: https://{s['PANEL_HOST']}:{s['AGG_PORT']}/p/{p['sub']}\n" for p in people)
+text+="\nRaw files on server:\n"
+text+=''.join(f"{p['name']}: /root/vpn-setup/dist/{p['name']}.vpn ; /root/vpn-setup/dist/{p['name']}.vless\n" for p in people)
 atomic('/root/vpn-handoff.md',text)
 PY
+if [[ -t 1 ]]; then
+  printf '\n===== PRIVATE VPN ACCESS DETAILS =====\n'
+  cat /root/vpn-handoff.md
+  printf '\n'
+fi
 if [[ "${APPLY_FIREWALL:-1}" == 1 ]]; then
-  step 'Apply temporary firewall; confirmation from a NEW SSH connection is required'
+  step 'Temporarily harden inbound firewall; VPN/NAT are already persistent'
   vpnctl firewall-apply --replace-firewall
-  printf '\nVPN local tests passed. Firewall is NOT persistent until confirmation. Read /root/vpn-handoff.md for private access details.\n'
+  cat <<EOF
+
+VPN IS ALREADY FUNCTIONAL and AWG NAT will survive reboot even if hardening rolls back.
+To make the inbound DROP firewall persistent:
+  1) Keep this SSH window open.
+  2) On YOUR COMPUTER open a NEW terminal and connect:
+       ssh -o ControlPath=none root@$PANEL_HOST
+  3) In that NEW SSH session run exactly:
+       vpnctl finish
+
+If you miss the 180-second confirmation window, only hardening rolls back.
+AWG/VLESS and the persistent NAT baseline keep working.
+Private access details: /root/vpn-handoff.md
+EOF
 else
-  printf '\nWARN: firewall explicitly skipped. This host is not hardened for public use.\n'
+  printf '\nWARN: inbound firewall hardening explicitly skipped. AWG NAT is persistent and VPN works, but INPUT/FORWARD remain permissive.\n'
+  printf 'Private access details: /root/vpn-handoff.md\n'
 fi
