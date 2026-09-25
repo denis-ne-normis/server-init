@@ -869,7 +869,7 @@ def main():
     parser.add_argument("command", choices=["repair", "doctor", "backup", "recover", "awg-start", "awg-stop", "cert-renew", "cert-deploy", "firewall-prime", "firewall-prime-runtime", "firewall-apply", "firewall-confirm", "firewall-rollback", "validate", "awg-upgrade", "awg-rollback"])
     parser.add_argument("token", nargs="?", default="")
     parser.add_argument("--replace-firewall", action="store_true")
-    parser.add_argument("--pre-firewall", action="store_true", help="bootstrap-only: NAT not applied yet")
+    parser.add_argument("--pre-firewall", action="store_true", help="bootstrap-only: restrictive firewall not applied yet")
     args = parser.parse_args()
     os.umask(0o077)
     if os.geteuid() != 0:
