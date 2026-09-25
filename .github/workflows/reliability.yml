@@ -28,6 +28,23 @@ jobs:
         run: |
           set -o pipefail
           /usr/bin/python3 -m unittest discover -s tests -v -b 2>&1 | tee test-results.txt
+      - name: Real Xray v26.6.1 key parser smoke test (no VPN installation)
+        shell: bash
+        run: |
+          curl -fLSs --connect-timeout 10 --max-time 120 --retry 2 \
+            https://github.com/XTLS/Xray-core/releases/download/v26.6.1/Xray-linux-64.zip \
+            -o "$RUNNER_TEMP/xray.zip"
+          echo "136e822e99e616692550723e8b607cd8858c62a390aea5704938bc27930904ba  $RUNNER_TEMP/xray.zip" | sha256sum --check
+          /usr/bin/python3 - <<'PYXRAY'
+          import os, zipfile
+          from pathlib import Path
+          directory = Path(os.environ['RUNNER_TEMP'])
+          with zipfile.ZipFile(directory / 'xray.zip') as archive:
+              binary = directory / 'xray-smoke'
+              binary.write_bytes(archive.read('xray'))
+              binary.chmod(0o700)
+          PYXRAY
+          /usr/bin/python3 tests/smoke_xray.py "$RUNNER_TEMP/xray-smoke"
       - name: Install linters only
         run: |
           sudo apt-get update
