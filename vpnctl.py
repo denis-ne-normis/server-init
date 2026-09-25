@@ -10,6 +10,7 @@ import base64
 import contextlib
 import fcntl
 import hashlib
+import http.client
 import ipaddress
 import json
 import os
@@ -26,6 +27,8 @@ import tarfile
 import tempfile
 import time
 import urllib.request
+import urllib.parse
+import zlib
 
 ROOT = Path("/root/vpn-setup")
 AWG_CONF = Path("/etc/amnezia/amneziawg/awg0.conf")
@@ -39,8 +42,12 @@ TOKEN = re.compile(r"[A-Za-z0-9_-]{16,128}\Z")
 
 
 def run(args, *, data=None, check=True, timeout=60):
-    result = subprocess.run([str(x) for x in args], input=data, text=True,
-                            capture_output=True, timeout=timeout, check=False)
+    try:
+        result = subprocess.run([str(x) for x in args], input=data, text=True,
+                                capture_output=True, timeout=timeout, check=False)
+    except subprocess.TimeoutExpired:
+        # TimeoutExpired.__str__ includes argv, which may contain credentials.
+        raise RuntimeError(f"{Path(str(args[0])).name} timed out; inspect local service logs") from None
     if check and result.returncode:
         # Commands/outputs may contain credentials. Never include them in diagnostics.
         raise RuntimeError(f"{Path(str(args[0])).name} failed (exit {result.returncode}); inspect local service logs")
@@ -165,6 +172,106 @@ def verify_awg(state, root=ROOT, conf=AWG_CONF, public=pubkey):
                 raise ValueError("AWG obfuscation mismatch")
 
 
+def verify_exports(state):
+    """Check the exact bytes that will be published, before touching services."""
+    from aggsub import read_file, read_map, page
+    people = people_from(state)
+    if read_map(ROOT) != {p["sub"]: p["name"] for p in people}:
+        raise ValueError("distribution map differs from saved identities")
+    for person in people:
+        name = person["name"]
+        page(ROOT, name, person["sub"])
+        link = urllib.parse.urlsplit(read_file(ROOT, f"dist/{name}.vless").decode().strip())
+        query = urllib.parse.parse_qs(link.query)
+        expected = {"pbk": state["REALITY_PUBLIC_KEY"], "sid": state["REALITY_SHORT_ID"],
+                    "sni": state["SNI_DONOR"], "security": "reality", "flow": "xtls-rprx-vision"}
+        if (link.username != person["uuid"] or link.hostname != state["PANEL_HOST"]
+                or link.port != int(state["VLESS_PORT"])
+                or any(query.get(k) != [v] for k, v in expected.items())):
+            raise ValueError("VLESS export differs from saved identities")
+        encoded = read_file(ROOT, f"dist/{name}.vpn").decode().strip()[6:]
+        packed = base64.b64decode(encoded + "=" * (-len(encoded) % 4), altchars=b"-_", validate=True)
+        decoder = zlib.decompressobj()
+        raw = decoder.decompress(packed[4:], 1024 * 1024 + 1)
+        if (len(packed) < 5 or not decoder.eof or decoder.unused_data
+                or len(raw) > 1024 * 1024 or int.from_bytes(packed[:4], "big") != len(raw)):
+            raise ValueError("invalid native Amnezia export")
+        outer = json.loads(raw)
+        native = json.loads(outer["containers"][0]["awg"]["last_config"])
+        disk = config_sections(read_file(ROOT, f"awg/clients/{name}.conf").decode())
+        embedded = config_sections(native["config"])
+        if [kind for kind, _ in embedded] != ["Interface", "Peer"]:
+            raise ValueError("invalid embedded Amnezia configuration")
+        # Legacy exports substitute DNS and may omit MTU; identity/route/obfs must agree.
+        for part, fields in ((0, ("PrivateKey", "Address", "S1", "S2", "S3", "S4", "H1", "H2", "H3", "H4", "I1")),
+                             (1, ("PublicKey", "PresharedKey", "Endpoint", "AllowedIPs"))):
+            if any(embedded[part][1].get(key) != disk[part][1].get(key) for key in fields):
+                raise ValueError("native Amnezia export differs from client config")
+        if (native.get("client_priv_key") != disk[0][1]["PrivateKey"]
+                or native.get("server_pub_key") != disk[1][1]["PublicKey"]
+                or native.get("psk_key") != disk[1][1]["PresharedKey"]):
+            raise ValueError("native Amnezia metadata differs from client config")
+
+
+def subscription_environment(state, settings):
+    """Validate the existing backend without silently changing panel settings."""
+    sub_port = settings.get("subPort", "2096")
+    if not 1 <= int(sub_port) <= 65535:
+        raise ValueError("invalid actual subscription port")
+    sub_path = settings.get("subPath", "/sub/")
+    if not re.fullmatch(r"/(?:[A-Za-z0-9_-]+/)*", sub_path):
+        raise ValueError("unsupported subscription path")
+    if settings.get("subEnable", "true").lower() != "true":
+        raise ValueError("3x-ui subscriptions are disabled; enable them explicitly before repair")
+    if settings.get("subListen", "") not in {"", "0.0.0.0", "127.0.0.1", "::"}:
+        raise ValueError("subscription listener must accept IPv4 loopback; configure it explicitly before repair")
+    cert, key = settings.get("subCertFile", ""), settings.get("subKeyFile", "")
+    if bool(cert) != bool(key):
+        raise ValueError("subscription TLS needs both certificate and key")
+    env = {"AGG_PORT": state["AGG_PORT"], "AGG_CERT": str(ETC / "tls/cert.pem"),
+           "AGG_KEY": str(ETC / "tls/key.pem"), "SUB_PORT": sub_port,
+           "SUB_SCHEME": "https" if cert else "http", "SUB_PATH": sub_path}
+    if cert:
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(cert, key)
+        if cert != settings.get("webCertFile") and not certificate_valid(cert):
+            raise ValueError("separate subscription certificate expired; renew it before repair")
+        env["SUB_CA"] = str(ETC / "sub-ca.pem")
+    return env
+
+
+def verify_live_awg():
+    """Read-only check; never adopt a different runtime identity or missing peers."""
+    expected = config_sections(AWG_CONF.read_text())
+    interface = expected[0][1]
+    actual = run(["awg", "show", "awg0", "public-key"]).stdout.strip()
+    port = run(["awg", "show", "awg0", "listen-port"]).stdout.strip()
+    peers = {peer["PublicKey"] for kind, peer in expected if kind == "Peer"}
+    live = set(run(["awg", "show", "awg0", "peers"]).stdout.split())
+    if actual != pubkey(interface["PrivateKey"]) or port != interface["ListenPort"] or peers != live:
+        raise ValueError("live AWG key/port/peers differ from disk; restore consistent state explicitly")
+
+
+def wait_distribution(state, cert, timeout=12):
+    context = ssl.create_default_context()
+    context.load_verify_locations(cert)
+    context.check_hostname = False  # The service is contacted over IPv4 loopback.
+    context.verify_flags |= ssl.VERIFY_X509_PARTIAL_CHAIN
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}),
+                                        urllib.request.HTTPSHandler(context=context))
+    end = time.monotonic() + timeout
+    while True:
+        try:
+            with opener.open(f"https://127.0.0.1:{int(state['AGG_PORT'])}/healthz", timeout=2) as response:
+                if response.status == 200 and response.read(16) == b"ok\n":
+                    return
+        except (OSError, ValueError, http.client.HTTPException):
+            pass
+        if time.monotonic() >= end:
+            raise RuntimeError("distributor did not become ready; inspect journalctl -u aggsub; backup path was printed")
+        time.sleep(0.2)
+
+
 def db_settings():
     with sqlite3.connect("file:/etc/x-ui/x-ui.db?mode=ro", uri=True) as db:
         return dict(db.execute("SELECT key,value FROM settings"))
@@ -174,10 +281,13 @@ def backup():
     target = Path("/root/vpn-backups")
     target.mkdir(mode=0o700, exist_ok=True)
     name = target / (time.strftime("%Y%m%d-%H%M%S") + "-" + secrets.token_hex(3) + ".tar.gz")
-    paths = [ROOT, AWG_CONF, Path("/root/aggsub.py"), ETC,
+    paths = [ROOT, AWG_CONF, Path("/root/aggsub.py"), ETC, LIB, DATA,
+             Path("/usr/local/bin/vpnctl"), Path("/root/.acme.sh"),
              Path("/etc/systemd/system/aggsub.service"),
              Path("/etc/systemd/system/awg-quick@awg0.service.d"),
              Path("/etc/nftables.conf"), Path("/root/cert")]
+    paths += sorted(Path("/etc/systemd/system").glob("vpn-awg-recover.*"))
+    paths += sorted(Path("/etc/systemd/system").glob("vpn-cert-renew.*"))
     with tempfile.TemporaryDirectory() as directory:
         db_copy = Path(directory) / "x-ui.db"
         if Path("/etc/x-ui/x-ui.db").exists():
@@ -254,6 +364,13 @@ def deploy_certificate(settings):
     if not certificate_valid(cert):
         raise ValueError("certificate expired; run vpnctl cert-renew before repair")
     protected_dir(ETC)
+    sub_cert = settings.get("subCertFile", "")
+    if sub_cert:
+        # A one-time copy becomes stale when a self-signed certificate/issuer rotates.
+        public_pem = Path(sub_cert).read_text()
+        ssl.PEM_cert_to_DER_cert(public_pem.split("-----END CERTIFICATE-----")[0] + "-----END CERTIFICATE-----")
+        atomic(ETC / "sub-ca.pem", public_pem, 0o640)
+        shutil.chown(ETC / "sub-ca.pem", user="root", group="vpn-dist")
     generation = ETC / ("tls-" + str(time.time_ns()))
     protected_dir(generation)
     for source, name in ((cert, "cert.pem"), (key, "key.pem")):
@@ -285,10 +402,18 @@ def repair(state):
     validate_state(state)
     verify_awg(state)
     settings = db_settings()
+    env = subscription_environment(state, settings)
+    verify_exports(state)
+    if run(["awg", "show", "awg0"], check=False).returncode == 0:
+        verify_live_awg()
     # Validate the pair, but permit renewal of an expired LE certificate below.
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.load_cert_chain(settings["webCertFile"], settings["webKeyFile"])
+    if not certificate_valid(settings["webCertFile"]) and (
+            "/cert/le/" not in settings["webCertFile"] or not Path("/root/.acme.sh/acme.sh").is_file()):
+        raise ValueError("expired certificate cannot be renewed automatically; restore TLS before repair")
     saved = backup()
+    print(f"Private backup: {saved}. Do not share this archive.", flush=True)
     if run(["id", "vpn-dist"], check=False).returncode:
         run(["useradd", "--system", "--user-group", "--no-create-home", "--shell", "/usr/sbin/nologin", "vpn-dist"])
     LIB.mkdir(mode=0o755, parents=True, exist_ok=True)
@@ -304,21 +429,6 @@ def repair(state):
     if not certificate_valid(settings["webCertFile"]):
         cert_renew(state)
     deploy_certificate(settings)
-    sub_port = settings.get("subPort", "2096")
-    if not 1 <= int(sub_port) <= 65535:
-        raise ValueError("invalid actual subscription port")
-    sub_path = settings.get("subPath", "/sub/")
-    if not re.fullmatch(r"/[A-Za-z0-9_/-]*/", sub_path):
-        raise ValueError("unsupported subscription path")
-    sub_cert = settings.get("subCertFile", "")
-    env = {"AGG_PORT": state["AGG_PORT"], "AGG_CERT": str(ETC / "tls/cert.pem"),
-           "AGG_KEY": str(ETC / "tls/key.pem"), "SUB_PORT": sub_port,
-           "SUB_SCHEME": "https" if sub_cert else "http", "SUB_PATH": sub_path}
-    if sub_cert:
-        shutil.copyfile(sub_cert, ETC / "sub-ca.pem")
-        shutil.chown(ETC / "sub-ca.pem", user="root", group="vpn-dist")
-        (ETC / "sub-ca.pem").chmod(0o640)
-        env["SUB_CA"] = str(ETC / "sub-ca.pem")
     atomic(ETC / "service.env", "".join(f"{k}={v}\n" for k, v in env.items()))
     install_unit("aggsub.service", """[Unit]
 Description=Bounded VPN configuration distributor
@@ -395,19 +505,18 @@ WantedBy=timers.target
     run(["systemctl", "reset-failed", "awg-quick@awg0"], check=False)
     run(["systemctl", "start", "awg-quick@awg0"])
     run(["systemctl", "restart", "aggsub"])
+    wait_distribution(state, settings["webCertFile"])
     run(["systemctl", "enable", "--now", "vpn-awg-recover.timer"])
     if "/cert/le/" in settings["webCertFile"]:
         run(["systemctl", "enable", "--now", "vpn-cert-renew.timer"])
+        # Migrate a legacy restart hook immediately, not only after the next expiry.
+        cert_renew(state)
     print(f"Repair applied. Backup: {saved}. VPN keys, peers and firewall were not changed.")
 
 
 def awg_start():
     if run(["awg", "show", "awg0"], check=False).returncode == 0:
-        expected = config_sections(AWG_CONF.read_text())[0][1]
-        actual = run(["awg", "show", "awg0", "public-key"]).stdout.strip()
-        port = run(["awg", "show", "awg0", "listen-port"]).stdout.strip()
-        if actual != pubkey(expected["PrivateKey"]) or port != expected["ListenPort"]:
-            raise ValueError("live AWG key/port differs from disk; refusing to adopt interface")
+        verify_live_awg()
         return
     run(["awg-quick", "up", "awg0"])
 
@@ -436,6 +545,10 @@ def cert_renew(state):
         raise ValueError("automatic renewal requires an existing acme.sh IP certificate")
     if certificate_valid(cert, 72 * 3600):
         if (ETC / "tls").exists():
+            # --install-cert persists the hook even when --issue is unnecessary.
+            run(["/root/.acme.sh/acme.sh", "--install-cert", "-d",
+                 str(ipaddress.IPv4Address(state["PANEL_HOST"])), "--ecc", "--fullchain-file", cert,
+                 "--key-file", key, "--reloadcmd", "/usr/local/bin/vpnctl cert-deploy"])
             deploy_certificate(settings)
         return
     # Inspect the actual certificate rather than trusting a stale 30-day ACME interval.
@@ -571,10 +684,7 @@ def doctor(state):
         errors += not good
     try:
         verify_awg(state)
-        peers = {p["PublicKey"] for kind, p in config_sections(AWG_CONF.read_text()) if kind == "Peer"}
-        live = set(run(["awg", "show", "awg0", "peers"]).stdout.split())
-        if peers != live:
-            raise ValueError("live AWG peers differ from saved config; no automatic overwrite performed")
+        verify_live_awg()
         print("OK saved AWG identities and live peer list match")
     except (OSError, ValueError, KeyError, RuntimeError) as exc:
         print(f"FAIL AWG config consistency: {exc}")
@@ -617,7 +727,7 @@ def doctor(state):
                         from aggsub import decode_subscription
                         decode_subscription(content)
                 print(f"OK /{route.split('/')[0]} endpoint")
-            except (OSError, ValueError):
+            except (OSError, ValueError, http.client.HTTPException):
                 print(f"FAIL /{route.split('/')[0]} endpoint (details intentionally omit personal token)")
                 errors += 1
     except (OSError, ValueError, ssl.SSLError):
@@ -679,6 +789,6 @@ def main():
 if __name__ == "__main__":
     try:
         sys.exit(main())
-    except (OSError, ValueError, KeyError, RuntimeError, subprocess.TimeoutExpired) as error:
+    except (OSError, ValueError, KeyError, TypeError, IndexError, RuntimeError, zlib.error, sqlite3.Error) as error:
         print(f"ERROR: {error}", file=sys.stderr)
         sys.exit(1)

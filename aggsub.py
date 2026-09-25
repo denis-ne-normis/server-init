@@ -95,7 +95,7 @@ class Config:
             raise ValueError("invalid port")
         if self.sub_scheme not in {"http", "https"}:
             raise ValueError("invalid subscription scheme")
-        if not re.fullmatch(r"/[A-Za-z0-9_/-]*/", self.sub_path):
+        if not re.fullmatch(r"/(?:[A-Za-z0-9_-]+/)*", self.sub_path):
             raise ValueError("invalid subscription path")
         if not 1 <= self.workers <= 128:
             raise ValueError("invalid worker limit")
