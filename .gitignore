@@ -1,10 +1,21 @@
-# ⚠️ НЕ коммитить секреты/выдачу конкретного сервера в публичный репозиторий!
+# Never commit real server identities, exports or backups.
 vpn-handoff.md
 secrets.env
+state.json
 *.env
+*.conf
+*.vpn
+*.vless
+*.pem
+*.key
+*.tar.gz
 *_qr.png
 *_qr.txt
 *_link.txt
 reality_keys.txt
 .cookies
 *.log
+__pycache__/
+*.py[cod]
+.coverage
+.DS_Store

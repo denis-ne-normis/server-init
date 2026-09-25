@@ -1,0 +1,59 @@
+name: Reliability regression tests
+on:
+  pull_request:
+  push:
+    branches: [main, 'fix/vpn-reliability-*']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Python and Bash syntax
+        run: |
+          /usr/bin/python3 --version
+          /usr/bin/python3 -m py_compile aggsub.py vpnctl.py provision.py
+          bash -n install.sh
+      - name: Regression tests (no host mutations)
+        shell: bash
+        run: |
+          set -o pipefail
+          /usr/bin/python3 -m unittest discover -s tests -v -b 2>&1 | tee test-results.txt
+      - name: Install linters only
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck nftables
+      - name: ShellCheck
+        run: shellcheck --severity=error install.sh
+      - name: Validate firewall in isolated network namespace
+        run: |
+          /usr/bin/python3 - <<'PY'
+          import sys
+          from pathlib import Path
+          sys.path.insert(0, 'tests')
+          from test_reliability import fixture
+          from vpnctl import firewall_text
+          Path('/tmp/server-init-test.nft').write_text(firewall_text(fixture()['settings'], 'ens3', [22, 2222]))
+          PY
+          sudo unshare --net nft -c -f /tmp/server-init-test.nft
+      - name: Snapshot reviewed source (tracked files only, no runtime secrets)
+        if: always()
+        run: git archive --format=tar HEAD -o review-source.tar
+      - name: Retain test evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: reliability-evidence-${{ matrix.os }}
+          retention-days: 7
+          path: |
+            review-source.tar
+            test-results.txt
