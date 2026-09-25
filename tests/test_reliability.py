@@ -417,6 +417,16 @@ class HostSafetyTests(unittest.TestCase):
         self.assertEqual(self.calls, [["nft", "-f", str(self.root / "old.nft")]])
         self.assertFalse((self.root / "pending.json").exists())
 
+    def test_hardening_rollback_keeps_persistent_baseline(self):
+        baseline = vpnctl.firewall_base_text(fixture()["settings"], "ens3")
+        (self.root / "persistent.nft").write_text(baseline)
+        pending = self.apply()
+        self.assertTrue(json.loads((self.root / "pending.json").read_text())["persistent_existed"])
+        with patch.object(vpnctl, "FW", self.root), patch.object(vpnctl, "run", side_effect=self.runner):
+            vpnctl.firewall_rollback(pending["token"])
+        self.assertEqual((self.root / "persistent.nft").read_text(), baseline)
+        self.assertNotIn("policy drop;", (self.root / "persistent.nft").read_text())
+
     def test_stale_timer_cannot_rollback_new_transaction(self):
         self.apply()
         self.calls.clear()
