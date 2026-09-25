@@ -752,7 +752,7 @@ def firewall_apply(state, replace=False):
         raise
     print("Firewall is TEMPORARY. Open a NEW SSH connection, then run:")
     print(f'sudo env SSH_CONNECTION="$SSH_CONNECTION" vpnctl firewall-confirm {token}')
-    print("Without confirmation, previous live rules are restored after 180 seconds. Disk config is unchanged.")
+    print("Without confirmation, previous live rules are restored after 180 seconds; persistent disk config is unchanged.")
 
 
 def firewall_rollback(token=""):
@@ -905,7 +905,7 @@ def main():
     parser.add_argument("command", choices=["repair", "doctor", "backup", "recover", "awg-start", "awg-stop", "cert-renew", "cert-deploy", "firewall-base", "firewall-apply", "firewall-confirm", "firewall-rollback", "finish", "handoff", "validate", "awg-upgrade", "awg-rollback"])
     parser.add_argument("token", nargs="?", default="")
     parser.add_argument("--replace-firewall", action="store_true")
-    parser.add_argument("--pre-firewall", action="store_true", help="bootstrap-only: NAT not applied yet")
+    parser.add_argument("--pre-firewall", action="store_true", help="bootstrap-only: hardened inbound firewall may not be confirmed yet")
     args = parser.parse_args()
     os.umask(0o077)
     if os.geteuid() != 0:
