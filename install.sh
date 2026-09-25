@@ -9,17 +9,21 @@ LOG=/var/log/vpn-install.log
 fail() { printf '\nERROR: %s\n' "$*" >&2; exit 1; }
 step() { printf '\n==> %s\n' "$*"; }
 RESUME_BEFORE_IDENTITIES=0
+RESUME_FROM_TLS=0
 case "$*" in
   '') ;;
   --resume-before-identities) RESUME_BEFORE_IDENTITIES=1 ;;
-  *) fail 'Usage: bash install.sh [--resume-before-identities]' ;;
+  --resume-from-tls) RESUME_FROM_TLS=1; RESUME_BEFORE_IDENTITIES=1 ;;
+  *) fail 'Usage: bash install.sh [--resume-before-identities|--resume-from-tls]' ;;
 esac
 [[ $EUID -eq 0 ]] || fail 'Run as root.'
-[[ -f "$HERE/vpnctl.py" && -f "$HERE/provision.py" && -f "$HERE/aggsub.py" ]] || fail 'Clone/download the COMPLETE repository and run bash install.sh there.'
+[[ -f "$HERE/vpnctl.py" && -f "$HERE/provision.py" && -f "$HERE/aggsub.py" && -f "$HERE/bootstrap_tls.py" ]] || fail 'Clone/download the COMPLETE repository and run bash install.sh there.'
 exec 9>/run/server-init.lock
 flock -n 9 || fail 'Another installer/maintenance operation is active.'
 # Never mutate an existing or partially installed VPN, even when secrets.env is missing.
-if [[ "$RESUME_BEFORE_IDENTITIES" == 1 ]]; then
+if [[ "$RESUME_FROM_TLS" == 1 ]]; then
+  python3 "$HERE/bootstrap_tls.py" check-resume || fail "TLS resume refused; no state was changed."
+elif [[ "$RESUME_BEFORE_IDENTITIES" == 1 ]]; then
   python3 "$HERE/provision.py" --check-resume-before-identities || fail 'Resume refused. Existing files were not changed.'
 elif [[ -e "$WORKDIR/state.json" || -e "$WORKDIR/secrets.env" || -e /etc/amnezia/amneziawg/awg0.conf || -e /etc/x-ui/x-ui.db ]]; then
   fail "Existing installation detected. Nothing changed. Use: sudo python3 $HERE/vpnctl.py repair (see README for partial installations)."
@@ -39,7 +43,7 @@ chmod 600 "$LOG"
 trap 'printf "ERROR: installation stopped at line %s. Log: %s. Existing identity state is retained; do not delete it to retry.\n" "$LINENO" "$LOG" >&2' ERR
 export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l
 export SNI_DONOR="${SNI_DONOR:-www.nvidia.com}" VLESS_PORT="${VLESS_PORT:-7443}" SRV_LABEL="${SRV_LABEL:-S1}"
-if [[ -t 0 ]]; then
+if [[ "$RESUME_FROM_TLS" == 0 && -t 0 ]]; then
   read -r -p "Reality donor [$SNI_DONOR]: " answer || answer=''
   SNI_DONOR="${answer:-$SNI_DONOR}"
   read -r -p "VLESS TCP port [$VLESS_PORT]: " answer || answer=''
@@ -67,18 +71,26 @@ if [[ "$RESUME_BEFORE_IDENTITIES" == 0 ]]; then
   bash "$WORKDIR/xui-installer.sh" "$XUI_VERSION" </dev/null >>"$LOG" 2>&1
   [[ -x /usr/local/x-ui/x-ui ]] || fail '3x-ui binary missing.'
 else
-  step 'Continue bootstrap before identities (packages and 3x-ui are NOT reinstalled)'
+  step 'Continue saved bootstrap (packages and 3x-ui are NOT reinstalled)'
   for tool in awg awg-quick curl jq qrencode openssl nft socat sqlite3; do
     command -v "$tool" >/dev/null || fail "Missing dependency $tool; bootstrap cannot continue."
   done
 fi
-export PUBIP="${PUBIP:-$(curl -fsS4 --connect-timeout 10 --max-time 20 https://api.ipify.org)}"
-python3 -c 'import ipaddress,os; ipaddress.IPv4Address(os.environ["PUBIP"])'
-step 'Persist all identities, then render configs (keys generated only on new installation)'
-python3 "$HERE/provision.py"
-# This is a freshly generated, safely shell-quoted file, not untrusted legacy input.
-# shellcheck source=/dev/null
-. "$WORKDIR/secrets.env"
+if [[ "$RESUME_FROM_TLS" == 1 ]]; then
+  python3 "$HERE/bootstrap_tls.py" safe-env > "$WORKDIR/.resume-safe.env"
+  # shellcheck source=/dev/null
+  . "$WORKDIR/.resume-safe.env"
+  rm -f "$WORKDIR/.resume-safe.env"
+  PYTHONPATH="$HERE" python3 -c 'import vpnctl; print("Private bootstrap backup:", vpnctl.backup())' || fail 'Backup failed.'
+else
+  export PUBIP="${PUBIP:-$(curl -fsS4 --connect-timeout 10 --max-time 20 https://api.ipify.org)}"
+  python3 -c 'import ipaddress,os; ipaddress.IPv4Address(os.environ["PUBIP"])'
+  step 'Persist all identities, then render configs (keys generated only on new installation)'
+  python3 "$HERE/provision.py"
+  # This is a freshly generated, safely shell-quoted file.
+  # shellcheck source=/dev/null
+  . "$WORKDIR/secrets.env"
+fi
 step 'Enable forwarding and optional BBR'
 cat > /etc/sysctl.d/99-vpn.conf <<'SYSCTL'
 net.ipv4.ip_forward=1
@@ -97,10 +109,9 @@ if [[ "${ENABLE_LE:-1}" == 1 ]]; then
   # Basic standalone issuance only needs acme.sh itself plus socat. systemd owns renewal.
   curl -fLSs --connect-timeout 10 --max-time 120 --retry 2 https://raw.githubusercontent.com/acmesh-official/acme.sh/3.1.6/acme.sh -o /root/.acme.sh/acme.sh
   chmod 700 /root/.acme.sh/acme.sh
-  /root/.acme.sh/acme.sh --issue --server letsencrypt -d "$PANEL_HOST" --standalone --keylength ec-256 --certificate-profile shortlived --days 3 >>"$LOG" 2>&1 || fail 'IP certificate issuance failed. Check inbound port 80 and ACME log. Do not rerun the installer over existing state.'
+  python3 "$HERE/bootstrap_tls.py" certificate || fail 'TLS bootstrap stopped; identities are retained. After correcting the reported error use: bash install.sh --resume-from-tls'
   PANEL_CERT=/root/cert/le/fullchain.pem
   PANEL_KEY=/root/cert/le/private.key
-  /root/.acme.sh/acme.sh --install-cert -d "$PANEL_HOST" --ecc --fullchain-file "$PANEL_CERT" --key-file "$PANEL_KEY" --reloadcmd /bin/true >>"$LOG" 2>&1
 else
   mkdir -p /root/cert/panel
   openssl req -x509 -nodes -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -days 365 \
