@@ -69,12 +69,16 @@ class XrayOutputTests(unittest.TestCase):
             calls.append(args)
             output = MODERN if args == ['xray-test', 'x25519'] else base64.b64encode(bytes([4])*32).decode()+'\n'
             return SimpleNamespace(stdout=output, stderr='', returncode=0)
-        env = {'PUBIP': '203.0.113.10', 'CLIENTS': 'one', 'PANEL_PORT': '39000'}
+        env = {'PUBIP': '203.0.113.10', 'PANEL_PORT': '39000'}
         with patch.object(provision, 'run', side_effect=runner):
             bundle = provision.new_state(env, 'xray-test')
         self.assertEqual(bundle['settings']['REALITY_PUBLIC_KEY'], PUBLIC)
         self.assertEqual(bundle['settings']['REALITY_PRIVATE_KEY'], PRIVATE)
         self.assertEqual(calls[0], ['xray-test', 'x25519'])
+        self.assertEqual(
+            [client['name'] for client in bundle['clients']],
+            ['denis', 'vlad', 'liza', 'parents', 'router', 'svyat', 'sveta', 'ruslan'],
+        )
 
     def test_bad_output_cannot_reach_awg_generation(self):
         with patch.object(provision, 'run', return_value=SimpleNamespace(stdout='Hash32: '+HASH, stderr='')) as run:
