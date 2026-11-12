@@ -96,7 +96,7 @@ def new_state(env, xray):
     if supplied:
         people = json.loads(supplied)
     else:
-        names = env.get("CLIENTS", "denis vlad liza parents router svyt").split()
+        names = env.get("CLIENTS", "denis vlad liza parents router svyat sveta ruslan").split()
         people = [{"name": n, "uuid": str(uuid.uuid4()), "sub": secrets.token_urlsafe(18)} for n in names]
     # Deliberately discard unexpected extra fields from cross-server CLIENTS_JSON.
     people = [{k: p[k] for k in ("name", "uuid", "sub")} for p in people]

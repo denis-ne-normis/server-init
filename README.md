@@ -77,7 +77,7 @@ sudo env SSH_CONNECTION="$SSH_CONNECTION" bash install.sh
 
 | Переменная | По умолчанию | Назначение |
 |---|---|---|
-| `CLIENTS` | `denis vlad liza parents router svyt` | Имена новых клиентов |
+| `CLIENTS` | `denis vlad liza parents router svyat sveta ruslan` | Имена новых клиентов |
 | `CLIENTS_JSON` | не задана | Общие `{name,uuid,sub}` для **нового** сервера |
 | `SNI_DONOR` | `www.nvidia.com` | Reality target/SNI; можно изменить при запросе |
 | `VLESS_PORT` | `7443` | TCP VLESS |
