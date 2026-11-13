@@ -10,6 +10,7 @@ import binascii
 from dataclasses import dataclass
 import html
 import http.server
+import ipaddress
 import logging
 import os
 from pathlib import Path
@@ -27,6 +28,22 @@ LOG = logging.getLogger("aggsub")
 TOKEN = re.compile(r"[A-Za-z0-9_-]{16,128}\Z")
 NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\Z")
 MAX_BODY = 1024 * 1024
+
+
+def subscription_host(value):
+    """Validate the configured Host header independently of the HTTP request."""
+    if not value:
+        return ""
+    try:
+        ip = ipaddress.ip_address(value[1:-1] if value.startswith("[") and value.endswith("]") else value)
+        if getattr(ip, "scope_id", None):
+            raise ValueError("scoped addresses are not supported")
+    except ValueError:
+        if len(value) > 253 or not all(re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?", label)
+                                       for label in value.split(".")):
+            raise ValueError("invalid subscription Host") from None
+        return value
+    return f"[{ip}]" if ip.version == 6 else str(ip)
 
 
 def read_file(root, relative):
@@ -89,6 +106,7 @@ class Config:
     workers: int = 32
     handshake_timeout: float = 4.0
     request_timeout: float = 10.0
+    sub_host: str = ""
 
     def __post_init__(self):
         if not 0 <= self.port <= 65535 or not 1 <= self.sub_port <= 65535:
@@ -99,6 +117,7 @@ class Config:
             raise ValueError("invalid subscription path")
         if not 1 <= self.workers <= 128:
             raise ValueError("invalid worker limit")
+        self.sub_host = subscription_host(self.sub_host)
 
     def upstream(self, token):
         if not TOKEN.fullmatch(token):
@@ -114,7 +133,10 @@ class Config:
             handlers.append(urllib.request.HTTPSHandler(context=ctx))
         opener = urllib.request.build_opener(*handlers)
         url = f"{self.sub_scheme}://127.0.0.1:{self.sub_port}{self.sub_path}{token}"
-        req = urllib.request.Request(url, headers={"User-Agent": "server-init/1", "Accept": "text/plain"})
+        headers = {"User-Agent": "server-init/1", "Accept": "text/plain"}
+        if self.sub_host:
+            headers["Host"] = self.sub_host
+        req = urllib.request.Request(url, headers=headers)
         with opener.open(req, timeout=4) as response:
             return decode_subscription(response.read(MAX_BODY + 1))
 
@@ -295,7 +317,8 @@ def main():
                  port=int(os.getenv("AGG_PORT", "2087")),
                  sub_port=int(os.getenv("SUB_PORT", "2096")),
                  sub_scheme=os.getenv("SUB_SCHEME", "http"),
-                 sub_path=os.getenv("SUB_PATH", "/sub/"), sub_ca=os.getenv("SUB_CA", ""))
+                 sub_path=os.getenv("SUB_PATH", "/sub/"), sub_ca=os.getenv("SUB_CA", ""),
+                 sub_host=os.getenv("SUB_HOST", ""))
     with Server(cfg) as server:
         signal.signal(signal.SIGHUP, lambda *_: server.reload_requested.set())
         LOG.info("config distributor listening on port %d", cfg.port)

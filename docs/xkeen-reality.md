@@ -92,7 +92,7 @@ REALITY прямо рекомендует его, хотя протокол по
 Источники: [REALITY README](https://github.com/XTLS/REALITY/blob/main/README.en.md),
 [актуальная документация REALITY](https://xtls.github.io/en/config/transports/reality.html).
 
-Меню предлагает `www.microsoft.com`, `www.apple.com`, `www.nvidia.com`, свой
+Меню предлагает `www.microsoft.com`, `www.ibm.com`, `www.nvidia.com`, свой
 hostname и авто. Это кандидаты для проверки, а не список «неблокируемых» сайтов.
 Авто параллельно проверяет сертификат/имя, TLS 1.3, ALPN h2, отклоняет обнаруженный
 междоменный HTTP-редирект и выбирает минимальное время TLS среди успешных кандидатов.
