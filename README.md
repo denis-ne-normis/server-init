@@ -68,7 +68,13 @@ SQLite, код установленного vpnctl/раздачи, её поко
 systemd и заголовки **работающего** ядра. Debian больше не получает Ubuntu PPA:
 отдельная поддержка Debian требует отдельной проверенной упаковки AWG.
 На Proxmox-хосте, Docker/Coolify-хосте или машине с существующим firewall не запускать.
-
+```bash
+git clone https://github.com/denis-ne-normis/server-init.git &&
+cd server-init &&
+git checkout --detach ebceec4b12f516f0ce28ad44e6ca8c7ffc41d56e &&
+sudo env SSH_CONNECTION="$SSH_CONNECTION" \
+  CLIENTS="denis router" PANEL_PORT=18443 bash install.sh
+```
 ```bash
 sudo env SSH_CONNECTION="$SSH_CONNECTION" bash install.sh
 ```
