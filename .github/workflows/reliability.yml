@@ -46,6 +46,7 @@ jobs:
           PYXRAY
           /usr/bin/python3 tests/smoke_xray.py "$RUNNER_TEMP/xray-smoke"
           /usr/bin/python3 tests/smoke_xkeen.py "$RUNNER_TEMP/xray-smoke"
+          TEST_VLESS_TRANSPORT=xhttp /usr/bin/python3 tests/smoke_xkeen.py "$RUNNER_TEMP/xray-smoke"
       - name: Install linters only
         run: |
           sudo apt-get update

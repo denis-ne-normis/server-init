@@ -6,6 +6,7 @@ Usage: python3 tests/smoke_xkeen.py /path/to/xray [server-xray]
 import contextlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import os
 from pathlib import Path
 import socket
 import ssl
@@ -68,6 +69,8 @@ def main():
         private, public = provision.parse_x25519(result.stdout, result.stderr)
         bundle = fixture()
         state = bundle['settings']
+        state['VLESS_TRANSPORT'] = os.getenv('TEST_VLESS_TRANSPORT', 'tcp')
+        state['XHTTP_PATH'] = '/smoke-profile'
         # Keep generated identities internally consistent; no test values printed.
         state.update(PANEL_HOST='127.0.0.1', VLESS_PORT=str(port()), SNI_DONOR='localhost.example.com',
                      REALITY_PRIVATE_KEY=private, REALITY_PUBLIC_KEY=public)
@@ -80,6 +83,9 @@ def main():
         }], 'outbounds': [{'protocol': 'freedom', 'settings': {
             # Only the disposable test server may proxy back to this local fixture.
             'finalRules': [{'action': 'allow', 'ip': ['127.0.0.1/32']}]}}]}
+        if state['VLESS_TRANSPORT'] == 'xhttp':
+            server['inbounds'][0]['settings']['clients'][0]['flow'] = ''
+            server['inbounds'][0]['streamSettings'].update(network='xhttp', xhttpSettings={'mode': 'auto', 'path': state['XHTTP_PATH']})
         server_path = root / 'server.json'
         server_path.write_text(json.dumps(server))
         processes = []
@@ -130,7 +136,7 @@ def main():
                     detail = detail.replace(value, '[test-identity]')
                 print(detail[-4000:])
                 raise RuntimeError(f'REALITY/Vision traffic failed for {fp}; no keys logged')
-            print(f'PASS generated XKeen JSON + real REALITY/Vision HTTP traffic ({fp})')
+            print(f"PASS generated XKeen JSON + real {state['VLESS_TRANSPORT']}/REALITY HTTP traffic ({fp})")
             stop(process)
             processes.remove(process)
 

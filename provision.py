@@ -111,6 +111,7 @@ def new_state(env, xray):
              "AWG_MTU": env.get("AWG_MTU", "1280" if env.get("AWG_PROTOCOL", "3.1") == "3.1" else "1376"),
              "REALITY_PRIVATE_KEY": private, "REALITY_PUBLIC_KEY": public,
              "REALITY_SHORT_ID": secrets.token_hex(8), "REALITY_FINGERPRINT": env.get("REALITY_FINGERPRINT", "chrome"),
+             "VLESS_TRANSPORT": env.get("VLESS_TRANSPORT", "tcp"), "XHTTP_PATH": env.get("XHTTP_PATH", "/" + secrets.token_hex(16)),
              "CLIENTS_JSON": json.dumps(people, separators=(",", ":"))}
     state["AWG_PROTOCOL"] = env.get("AWG_PROTOCOL", "3.1")
     if awg_profile.version(state) == "3.1":
@@ -173,7 +174,7 @@ def render(bundle, root=ROOT, awg_conf=AWG_CONF, qr=True):
     atomic(root / "awg/submap.tsv", "".join(f"{p['sub']}\t{p['name']}\n" for p in bundle["clients"]))
     atomic(root / "awg/label", state["SRV_LABEL"])
     atomic(root / "secrets.env", "".join(f"{k}={shlex.quote(v)}\n" for k, v in state.items()))
-    clients = [{"id": p["uuid"], "flow": "xtls-rprx-vision", "email": p["name"], "limitIp": 0,
+    clients = [{"id": p["uuid"], "flow": xray_profile.flow(state), "email": p["name"], "limitIp": 0,
                 "totalGB": 0, "expiryTime": 0, "enable": True, "tgId": "", "subId": p["sub"], "comment": "", "reset": 0}
                for p in bundle["clients"]]
     reality = {"show": False, "target": state["SNI_DONOR"] + ":443", "xver": 0,
@@ -185,6 +186,11 @@ def render(bundle, root=ROOT, awg_conf=AWG_CONF, qr=True):
                "streamSettings": json.dumps({"network": "tcp", "security": "reality", "realitySettings": reality,
                                               "tcpSettings": {"acceptProxyProtocol": False, "header": {"type": "none"}}}),
                "sniffing": json.dumps({"enabled": True, "destOverride": ["http", "tls", "quic"], "metadataOnly": False, "routeOnly": False})}
+    if xray_profile.transport(state) == "xhttp":
+        stream = json.loads(inbound["streamSettings"])
+        stream.pop("tcpSettings")
+        stream.update(network="xhttp", xhttpSettings={"path": xray_profile.xhttp_path(state), "mode": "auto"})
+        inbound.update(remark="VLESS-XHTTP-Reality", streamSettings=json.dumps(stream))
     atomic(root / "inbound.json", json.dumps(inbound))
 
 

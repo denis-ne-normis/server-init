@@ -118,6 +118,8 @@ def validate_state(state):
     ipaddress.IPv4Address(state["PANEL_HOST"])
     xray_profile.donor_name(state["SNI_DONOR"])
     xray_profile.fingerprint(state)
+    xray_profile.transport(state)
+    xray_profile.xhttp_path(state)
     return state
 
 
@@ -187,7 +189,7 @@ def verify_exports(state):
         link = urllib.parse.urlsplit(read_file(ROOT, f"dist/{name}.vless").decode().strip())
         query = urllib.parse.parse_qs(link.query)
         expected = {"pbk": state["REALITY_PUBLIC_KEY"], "sid": state["REALITY_SHORT_ID"],
-                    "sni": state["SNI_DONOR"], "security": "reality", "flow": "xtls-rprx-vision"}
+                    "sni": state["SNI_DONOR"], "security": "reality"}
         if (link.username != person["uuid"] or link.hostname != state["PANEL_HOST"]
                 or link.port != int(state["VLESS_PORT"])
                 or any(query.get(k) != [v] for k, v in expected.items())):

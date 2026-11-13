@@ -47,6 +47,21 @@ class RouterTests(unittest.TestCase):
             with patch.object(vpnctl, 'ROOT', self.root):
                 vpnctl.verify_exports(self.state)
 
+    def test_xhttp_matches_server_and_rejects_vision(self):
+        self.state.update(VLESS_TRANSPORT='xhttp', XHTTP_PATH='/test-path')
+        provision.render(self.bundle, self.root, self.root / 'awg.conf', qr=False)
+        outbound = json.loads(self.path.read_text())['outbounds'][0]
+        inbound = json.loads((self.root / 'inbound.json').read_text())
+        self.assertNotIn('flow', outbound['settings']['vnext'][0]['users'][0])
+        self.assertEqual(json.loads(inbound['settings'])['clients'][0]['flow'], '')
+        self.assertEqual(outbound['streamSettings']['xhttpSettings'],
+                         json.loads(inbound['streamSettings'])['xhttpSettings'])
+        with patch.object(vpnctl, 'ROOT', self.root):
+            vpnctl.verify_exports(self.state)
+        link = (self.root / 'dist/test-client.vless').read_text()
+        with self.assertRaises(ValueError):
+            xray_profile.xkeen_config(link.replace('type=xhttp', 'flow=xtls-rprx-vision&type=xhttp'))
+
     def test_legacy_repair_adds_only_router_file_preserving_old_fingerprint(self):
         link = self.root / 'dist/test-client.vless'
         link.write_text(link.read_text().replace('fp=chrome', 'fp=firefox').replace('&type=tcp', ''))
@@ -119,6 +134,20 @@ class RouterHTTPTests(unittest.TestCase):
 
 
 class ChoiceTests(unittest.TestCase):
+    def test_ipv6_only_listener_is_a_port_conflict(self):
+        try:
+            sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+            self.addCleanup(sock.close)
+            sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+            sock.bind(('::', 0))
+        except OSError:
+            self.skipTest('IPv6 unavailable')
+        with self.assertRaisesRegex(ValueError, 'IPv6'):
+            reality_setup.check_port(sock.getsockname()[1])
+
+    def test_xhttp_menu(self):
+        self.assertEqual(self.choose({}, ['1', '1', '1', '2'])['VLESS_TRANSPORT'], 'xhttp')
+
     def choose(self, env, answers=None, check=None):
         with patch.object(reality_setup.socket, 'socket'), contextlib.redirect_stderr(io.StringIO()):
             return reality_setup.choose(env, answers is not None, iter(answers).__next__ if answers else input,
@@ -127,14 +156,14 @@ class ChoiceTests(unittest.TestCase):
     def test_default_auto_uses_successful_fastest_candidate(self):
         results = {reality_setup.DONORS[0]: (False, 1, 'FAIL'), reality_setup.DONORS[1]: (True, 20, 'OK'), reality_setup.DONORS[2]: (True, 30, 'OK')}
         selected = self.choose({}, check=results.__getitem__)
-        self.assertEqual(selected, {'SNI_DONOR': reality_setup.DONORS[1], 'VLESS_PORT': '443', 'REALITY_FINGERPRINT': 'chrome'})
+        self.assertEqual(selected, {'SNI_DONOR': reality_setup.DONORS[1], 'VLESS_PORT': '443', 'REALITY_FINGERPRINT': 'chrome', 'VLESS_TRANSPORT': 'tcp'})
 
     def test_menu_custom_and_presets(self):
-        self.assertEqual(self.choose({}, ['4', 'target.example.com', '3', '18443', '2']),
-                         {'SNI_DONOR': 'target.example.com', 'VLESS_PORT': '18443', 'REALITY_FINGERPRINT': 'firefox'})
-        self.assertEqual(self.choose({}, ['3', '2', '1'])['VLESS_PORT'], '7443')
+        self.assertEqual(self.choose({}, ['4', 'target.example.com', '3', '18443', '2', '1']),
+                         {'SNI_DONOR': 'target.example.com', 'VLESS_PORT': '18443', 'REALITY_FINGERPRINT': 'firefox', 'VLESS_TRANSPORT': 'tcp'})
+        self.assertEqual(self.choose({}, ['3', '2', '1', '1'])['VLESS_PORT'], '7443')
         custom = {'SNI_DONOR': 'other.example.com', 'VLESS_PORT': '9443', 'REALITY_FINGERPRINT': 'safari'}
-        self.assertEqual(self.choose(custom, ['', '', '']), custom)
+        self.assertEqual(self.choose(custom, ['', '', '', '']), dict(custom, VLESS_TRANSPORT='tcp'))
 
     def test_invalid_host_ports_and_failed_tls_stop_selection(self):
         for env in ({'SNI_DONOR': 'https://example.com'}, {'SNI_DONOR': 'bad..example.com'},

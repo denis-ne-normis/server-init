@@ -5,6 +5,7 @@ stdout contains only shell-quoted assignments; prompts/results go to stderr.
 No target is advertised as unblockable. Checks describe the VPS -> target path.
 """
 from concurrent.futures import ThreadPoolExecutor
+import errno
 import os
 import re
 import shlex
@@ -63,10 +64,24 @@ def ask(prompt, default, read=input):
     return value or default
 
 
+def check_port(port):
+    for family, address in ((socket.AF_INET, '0.0.0.0'), (socket.AF_INET6, '::')):
+        try:
+            with socket.socket(family, socket.SOCK_STREAM) as sock:
+                if family == socket.AF_INET6:
+                    sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+                sock.bind((address, port))
+        except OSError as error:
+            if family == socket.AF_INET6 and error.errno in (errno.EAFNOSUPPORT, errno.EPROTONOSUPPORT, errno.EADDRNOTAVAIL):
+                continue  # IPv6 is disabled on this host.
+            raise ValueError('TCP-порт недоступен по IPv4 или IPv6; выберите свободный порт') from None
+
+
 def choose(env, interactive=False, read=input, check=probe):
     host = env.get("SNI_DONOR", "auto")
     port = env.get("VLESS_PORT", "443")
     fp = env.get("REALITY_FINGERPRINT", "chrome")
+    network = env.get("VLESS_TRANSPORT", "tcp")
     if interactive:
         print("\nREALITY: универсального лучшего сайта нет. Проверка идёт с VPS, не из сети клиента.\n"
               "0) Авто: проверить кандидатов и выбрать минимальное время TLS\n"
@@ -101,6 +116,17 @@ def choose(env, interactive=False, read=input, check=probe):
                 fp = FINGERPRINTS[int(selection) - 1]
                 break
             print("Выберите пункт 1–3.", file=sys.stderr)
+        print("\nПрофиль VLESS:\n1) TCP + REALITY + Vision — простой прямой профиль\n"
+              "2) XHTTP + REALITY — HTTP/2, без Vision\n"
+              "TLS и XHTTP не альтернативы: XHTTP — транспорт. Для XHTTP + TLS нужен отдельный домен и сертификат.", file=sys.stderr)
+        while True:
+            selection = ask("Профиль", "2" if network == "xhttp" else "1", read)
+            if selection in ("1", "2"):
+                network = {"1": "tcp", "2": "xhttp"}[selection]
+                break
+            print("Выберите пункт 1–2.", file=sys.stderr)
+    if network not in ("tcp", "xhttp"):
+        raise ValueError("VLESS_TRANSPORT: tcp или xhttp")
     if not port.isascii() or not port.isdecimal() or not 1 <= int(port) <= 65535:
         raise ValueError("TCP-порт должен быть 1..65535")
     if int(port) == 80 or any(int(port) == int(env.get(key, fallback)) for key, fallback in
@@ -109,11 +135,7 @@ def choose(env, interactive=False, read=input, check=probe):
     if fp not in FINGERPRINTS:
         raise ValueError("fingerprint: chrome, firefox или safari")
     # Read-only availability check; never kill a listener to free the selected port.
-    with socket.socket() as sock:
-        try:
-            sock.bind(("0.0.0.0", int(port)))
-        except OSError:
-            raise ValueError("TCP-порт недоступен; выберите свободный порт") from None
+    check_port(int(port))
     candidates = DONORS if host == "auto" else (donor_name(host),)
     print("\nПроверяю TLS 1.3, ALPN h2 и сертификаты кандидатов…", file=sys.stderr, flush=True)
     with ThreadPoolExecutor(max_workers=3) as pool:
@@ -126,9 +148,9 @@ def choose(env, interactive=False, read=input, check=probe):
     if not valid:
         raise ValueError("нет подходящего target; проверьте DNS/выход в интернет или укажите другой SNI_DONOR")
     host = min(valid)[1]
-    print(f"Выбрано: {host}:443, VLESS TCP {int(port)}, fingerprint {fp}.\n"
+    print(f"Выбрано: {host}:443, VLESS {network.upper()} {int(port)}, fingerprint {fp}.\n"
           "Обновите Xray на роутере; успешный TLS-тест не доказывает обход фильтра вашего провайдера.", file=sys.stderr)
-    return {"SNI_DONOR": host, "VLESS_PORT": str(int(port)), "REALITY_FINGERPRINT": fp}
+    return {"SNI_DONOR": host, "VLESS_PORT": str(int(port)), "REALITY_FINGERPRINT": fp, "VLESS_TRANSPORT": network}
 
 
 if __name__ == "__main__":
