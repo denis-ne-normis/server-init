@@ -104,11 +104,17 @@ def main():
     note('PASS real AmneziaWG packages and running-kernel module')
     # Reset runner's Docker-created rules, never a persistent/user host firewall.
     command(['nft', 'flush', 'ruleset'])
-    xui = release('MHSanaei/3x-ui', 'v3.2.8', 'x-ui-linux-amd64.tar.gz')
+    xui = release('MHSanaei/3x-ui', 'v3.11.0', 'x-ui-linux-amd64.tar.gz')
     command(['tar', '-xzf', xui, '-C', '/usr/local'])
     command(['chmod', '+x', '/usr/local/x-ui/x-ui'])
     for p in Path('/usr/local/x-ui/bin').glob('xray-linux-*'):
         p.chmod(0o755)
+    # Exercise the same explicitly pinned core as the new installer.
+    import zipfile
+    xray_archive = release('XTLS/Xray-core', 'v26.11.9', 'Xray-linux-64.zip')
+    with zipfile.ZipFile(xray_archive) as archive:
+        p.write_bytes(archive.read('xray'))
+    p.chmod(0o755)
     Path('/etc/systemd/system/x-ui.service').write_text('[Unit]\nDescription=Integration 3x-ui\nAfter=network.target\n[Service]\nType=simple\nWorkingDirectory=/usr/local/x-ui\nExecStart=/usr/local/x-ui/x-ui\nRestart=on-failure\n[Install]\nWantedBy=multi-user.target\n')
     command(['systemctl', 'daemon-reload'])
     command(['/usr/local/x-ui/x-ui', 'migrate'])

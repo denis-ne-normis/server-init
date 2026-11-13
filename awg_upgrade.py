@@ -245,7 +245,7 @@ def install_code():
     # Dependencies first, entry point last; never call repair (it can restart x-ui).
     source = Path(__file__).resolve().parent
     v.LIB.mkdir(mode=0o755, parents=True, exist_ok=True)
-    for name in ('awg_profile.py', 'provision.py', 'awg_upgrade.py', 'vpnctl.py'):
+    for name in ('xray_profile.py', 'awg_profile.py', 'provision.py', 'awg_upgrade.py', 'vpnctl.py'):
         if (source / name).resolve() != (v.LIB / name).resolve():
             v.atomic(v.LIB / name, (source / name).read_text(), 0o644)
 

@@ -112,7 +112,7 @@ class ReviewTests(unittest.TestCase):
 
     def test_stale_vless_key_rejected(self):
         path = self.source / 'dist/test-client.vless'
-        path.write_text(path.read_text().replace('test-only-public', 'wrong-public'))
+        path.write_text(path.read_text().replace(self.state['REALITY_PUBLIC_KEY'], 'wrong-public'))
         with self.sandbox(), self.assertRaisesRegex(ValueError, 'VLESS export'):
             vpnctl.verify_exports(self.state)
 
