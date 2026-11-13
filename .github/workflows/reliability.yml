@@ -21,20 +21,20 @@ jobs:
       - name: Python and Bash syntax
         run: |
           /usr/bin/python3 --version
-          /usr/bin/python3 -m py_compile aggsub.py vpnctl.py provision.py awg_profile.py awg_upgrade.py
+          /usr/bin/python3 -m py_compile aggsub.py vpnctl.py provision.py awg_profile.py awg_upgrade.py xray_profile.py reality_setup.py awg_kernel_compat.py
           bash -n install.sh
       - name: Regression tests (no host mutations)
         shell: bash
         run: |
           set -o pipefail
           /usr/bin/python3 -m unittest discover -s tests -v -b 2>&1 | tee test-results.txt
-      - name: Real Xray v26.6.1 key parser smoke test (no VPN installation)
+      - name: Real Xray v26.11.9 keys and XKeen REALITY traffic (loopback only)
         shell: bash
         run: |
           curl -fLSs --connect-timeout 10 --max-time 120 --retry 2 \
-            https://github.com/XTLS/Xray-core/releases/download/v26.6.1/Xray-linux-64.zip \
+            https://github.com/XTLS/Xray-core/releases/download/v26.11.9/Xray-linux-64.zip \
             -o "$RUNNER_TEMP/xray.zip"
-          echo "136e822e99e616692550723e8b607cd8858c62a390aea5704938bc27930904ba  $RUNNER_TEMP/xray.zip" | sha256sum --check
+          echo "b651f7e1d9966ee2c1b1ee1bf8b52c72771824d3065dce96bbc8bcc19ed95f82  $RUNNER_TEMP/xray.zip" | sha256sum --check
           /usr/bin/python3 - <<'PYXRAY'
           import os, zipfile
           from pathlib import Path
@@ -45,6 +45,8 @@ jobs:
               binary.chmod(0o700)
           PYXRAY
           /usr/bin/python3 tests/smoke_xray.py "$RUNNER_TEMP/xray-smoke"
+          /usr/bin/python3 tests/smoke_xkeen.py "$RUNNER_TEMP/xray-smoke"
+          TEST_VLESS_TRANSPORT=xhttp /usr/bin/python3 tests/smoke_xkeen.py "$RUNNER_TEMP/xray-smoke"
       - name: Install linters only
         run: |
           sudo apt-get update

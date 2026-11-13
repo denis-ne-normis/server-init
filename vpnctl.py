@@ -30,6 +30,7 @@ import time
 import urllib.request
 import urllib.parse
 import zlib
+import xray_profile
 
 ROOT = Path("/root/vpn-setup")
 AWG_CONF = Path("/etc/amnezia/amneziawg/awg0.conf")
@@ -115,8 +116,10 @@ def validate_state(state):
         raise ValueError("invalid AWG port")
     ipaddress.IPv4Network(state["AWG_SUBNET"] + ".0/24")
     ipaddress.IPv4Address(state["PANEL_HOST"])
-    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.-]{0,252}", state["SNI_DONOR"]):
-        raise ValueError("invalid Reality donor")
+    xray_profile.donor_name(state["SNI_DONOR"])
+    xray_profile.fingerprint(state)
+    xray_profile.transport(state)
+    xray_profile.xhttp_path(state)
     return state
 
 
@@ -186,11 +189,17 @@ def verify_exports(state):
         link = urllib.parse.urlsplit(read_file(ROOT, f"dist/{name}.vless").decode().strip())
         query = urllib.parse.parse_qs(link.query)
         expected = {"pbk": state["REALITY_PUBLIC_KEY"], "sid": state["REALITY_SHORT_ID"],
-                    "sni": state["SNI_DONOR"], "security": "reality", "flow": "xtls-rprx-vision"}
+                    "sni": state["SNI_DONOR"], "security": "reality"}
         if (link.username != person["uuid"] or link.hostname != state["PANEL_HOST"]
                 or link.port != int(state["VLESS_PORT"])
                 or any(query.get(k) != [v] for k, v in expected.items())):
             raise ValueError("VLESS export differs from saved identities")
+        expected_router = xray_profile.xkeen_config(link.geturl(), state, person)
+        router = ROOT / f"dist/{name}-04_outbounds.json"
+        # Legacy installs do not have this derived artifact yet. Existing files
+        # must match before repair can publish anything or touch services.
+        if router.is_symlink() or (router.exists() and json.loads(router.read_text()) != expected_router):
+            raise ValueError("XKeen export differs from VLESS link")
         encoded = read_file(ROOT, f"dist/{name}.vpn").decode().strip()[6:]
         packed = base64.b64decode(encoded + "=" * (-len(encoded) % 4), altchars=b"-_", validate=True)
         decoder = zlib.decompressobj()
@@ -323,18 +332,33 @@ def protected_dir(path):
     path.chmod(0o750)
 
 
+def ensure_router_exports(state):
+    """Called after backup and preflight; never regenerates VPN identities."""
+    for person in people_from(state):
+        name = person["name"]
+        config = xray_profile.xkeen_config((ROOT / f"dist/{name}.vless").read_text(), state, person)
+        path = ROOT / f"dist/{name}-04_outbounds.json"
+        if path.is_symlink() or (path.exists() and json.loads(path.read_text()) != config):
+            raise ValueError("XKeen export differs from VLESS link")
+        if not path.exists():
+            atomic(path, json.dumps(config, indent=2) + "\n")
+
+
 def publish(state):
     from aggsub import read_map
     mapping = read_map(ROOT)
     if mapping != {p["sub"]: p["name"] for p in people_from(state)}:
         raise ValueError("distribution map differs from saved identities")
+    # All callers (repair and AWG migration/rollback) have already backed up.
+    # An older installation may never have had this derived export.
+    ensure_router_exports(state)
     protected_dir(DATA)
     protected_dir(DATA / "releases")
     generation = DATA / "releases" / (str(time.time_ns()) + "-" + secrets.token_hex(3))
     protected_dir(generation)
     files = ["awg/submap.tsv", "awg/label"]
     for name in mapping.values():
-        files += [f"awg/clients/{name}.conf", f"dist/{name}.vless", f"dist/{name}.vpn"]
+        files += [f"awg/clients/{name}.conf", f"dist/{name}.vless", f"dist/{name}.vpn", f"dist/{name}-04_outbounds.json"]
         if (ROOT / f"dist/{name}-vless.png").is_file():
             files.append(f"dist/{name}-vless.png")
     try:
@@ -354,6 +378,10 @@ def publish(state):
         from aggsub import page
         for token, name in mapping.items():
             page(generation, name, token)  # Fail before publication on incomplete exports.
+            person = next(p for p in people_from(state) if p["name"] == name)
+            expected = xray_profile.xkeen_config((generation / f"dist/{name}.vless").read_text(), state, person)
+            if json.loads((generation / f"dist/{name}-04_outbounds.json").read_text()) != expected:
+                raise ValueError("XKeen export differs from VLESS link")
         next_link = DATA / (".current-" + secrets.token_hex(4))
         next_link.symlink_to(generation)
         os.replace(next_link, DATA / "current")
@@ -432,7 +460,7 @@ def repair(state):
         run(["useradd", "--system", "--user-group", "--no-create-home", "--shell", "/usr/sbin/nologin", "vpn-dist"])
     LIB.mkdir(mode=0o755, parents=True, exist_ok=True)
     LIB.chmod(0o755)  # The unprivileged distributor must be able to traverse this directory.
-    for name in ("vpnctl.py", "aggsub.py", "provision.py", "awg_profile.py", "awg_upgrade.py"):
+    for name in ("vpnctl.py", "aggsub.py", "provision.py", "awg_profile.py", "awg_upgrade.py", "xray_profile.py"):
         source = Path(__file__).resolve().parent / name
         dest = LIB / name
         if source != dest:
@@ -824,7 +852,7 @@ def doctor(state, pre_firewall=False):
         ctx.check_hostname = False
         ctx.verify_flags |= ssl.VERIFY_X509_PARTIAL_CHAIN
         token = people_from(state)[0]["sub"]
-        for route in ("healthz", "p/" + token, "awg/" + token, "sub/" + token):
+        for route in ("healthz", "p/" + token, "awg/" + token, "sub/" + token, "xkeen/" + token):
             url = f"https://127.0.0.1:{int(state['AGG_PORT'])}/{route}"
             opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), urllib.request.HTTPSHandler(context=ctx))
             try:
@@ -835,6 +863,11 @@ def doctor(state, pre_firewall=False):
                     if route.startswith("sub/"):
                         from aggsub import decode_subscription
                         decode_subscription(content)
+                    if route.startswith("xkeen/"):
+                        person = people_from(state)[0]
+                        expected = xray_profile.xkeen_config((ROOT / f"dist/{person['name']}.vless").read_text(), state, person)
+                        if json.loads(content) != expected:
+                            raise ValueError("XKeen download differs from saved VLESS profile")
                 print(f"OK /{route.split('/')[0]} endpoint")
             except (OSError, ValueError, http.client.HTTPException):
                 print(f"FAIL /{route.split('/')[0]} endpoint (details intentionally omit personal token)")
@@ -877,7 +910,7 @@ def print_handoff():
         raise ValueError("private handoff file missing")
     print("\n===== PRIVATE VPN ACCESS DETAILS =====")
     print(path.read_text().rstrip())
-    print("\nRaw client files: /root/vpn-setup/dist/<name>.vpn and <name>.vless")
+    print("\nRaw client files: /root/vpn-setup/dist/<name>.vpn, <name>.vless, <name>-04_outbounds.json")
     print("Do not paste private vpn:// keys, panel password or backup archives into public chats/issues.")
 
 

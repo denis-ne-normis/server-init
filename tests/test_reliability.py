@@ -36,7 +36,7 @@ def fixture():
     state = {"PANEL_PORT": "39000", "VLESS_PORT": "7443", "AWG_PORT": "39743", "SUB_PORT": "2096",
              "AGG_PORT": "2087", "AWG_SUBNET": "10.9.7", "PANEL_HOST": "203.0.113.10",
              "SNI_DONOR": "www.example.com", "CLIENTS_JSON": json.dumps([person]),
-             "REALITY_PRIVATE_KEY": "test-only-private", "REALITY_PUBLIC_KEY": "test-only-public",
+             "REALITY_PRIVATE_KEY": "test-only-private", "REALITY_PUBLIC_KEY": base64.urlsafe_b64encode(bytes([9]) * 32).decode().rstrip("="),
              "REALITY_SHORT_ID": "1234567890abcdef", "SRV_LABEL": "TEST", "AWG_MTU": "1376",
              "AWG_SRV_PRIV": KEYS[0], "BLOCK_SMTP": "1"}
     client = dict(person, private=KEYS[1], public=KEYS[3], psk=KEYS[4], ip="10.9.7.2")

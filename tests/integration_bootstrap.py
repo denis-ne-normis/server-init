@@ -70,6 +70,9 @@ def snapshot():
 
 def redact_log():
     text = PRIVATE.read_text() if PRIVATE.exists() else ''
+    build_log = Path('/var/lib/dkms/amneziawg/1.0.0/build/make.log')
+    if build_log.exists():
+        text += '\nAWG DKMS build log:\n' + build_log.read_text(errors='replace')[-16000:]
     if (vpnctl.ROOT / 'state.json').exists():
         bundle = json.loads((vpnctl.ROOT / 'state.json').read_text())
         fields = list(bundle['settings'].values())
@@ -99,16 +102,26 @@ def main():
              'qrencode', 'nftables', 'software-properties-common', 'iproute2', f'linux-headers-{os.uname().release}'], env=env)
     command(['add-apt-repository', '-y', 'ppa:amnezia/ppa'], env=env)
     command(['apt-get', 'update'], env=env)
-    command(['apt-get', 'install', '-y', 'amneziawg', 'amneziawg-tools'], env=env)
+    package_args = ['apt-get', 'install', '-y', 'amneziawg', 'amneziawg-tools']
+    if command(package_args, env=env, check=False).returncode:
+        note('Retry AWG package with checksum-verified upstream compatibility fix')
+        command([sys.executable, SOURCE / 'awg_kernel_compat.py'])
+        command(package_args, env=env)
     command(['modprobe', 'amneziawg'])
     note('PASS real AmneziaWG packages and running-kernel module')
     # Reset runner's Docker-created rules, never a persistent/user host firewall.
     command(['nft', 'flush', 'ruleset'])
-    xui = release('MHSanaei/3x-ui', 'v3.2.8', 'x-ui-linux-amd64.tar.gz')
+    xui = release('MHSanaei/3x-ui', 'v3.11.0', 'x-ui-linux-amd64.tar.gz')
     command(['tar', '-xzf', xui, '-C', '/usr/local'])
     command(['chmod', '+x', '/usr/local/x-ui/x-ui'])
     for p in Path('/usr/local/x-ui/bin').glob('xray-linux-*'):
         p.chmod(0o755)
+    # Exercise the same explicitly pinned core as the new installer.
+    import zipfile
+    xray_archive = release('XTLS/Xray-core', 'v26.11.9', 'Xray-linux-64.zip')
+    with zipfile.ZipFile(xray_archive) as archive:
+        p.write_bytes(archive.read('xray'))
+    p.chmod(0o755)
     Path('/etc/systemd/system/x-ui.service').write_text('[Unit]\nDescription=Integration 3x-ui\nAfter=network.target\n[Service]\nType=simple\nWorkingDirectory=/usr/local/x-ui\nExecStart=/usr/local/x-ui/x-ui\nRestart=on-failure\n[Install]\nWantedBy=multi-user.target\n')
     command(['systemctl', 'daemon-reload'])
     command(['/usr/local/x-ui/x-ui', 'migrate'])

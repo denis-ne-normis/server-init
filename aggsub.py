@@ -146,6 +146,17 @@ a{{color:#a9cbff}}button{{padding:12px;margin:10px 0}}small{{color:#b0b9cc}}
 <section><h2>VLESS Reality / роутер</h2><p>Импортируй ссылку или QR в совместимый клиент.</p>{qr_html}
 <textarea id="v" readonly>{e(vless)}</textarea><button onclick="copyKey('v',this)">Скопировать VLESS</button>
 <p><a href="/sub/{token}">Адрес подписки</a> · <a href="https://hiddify.com/" rel="noreferrer">Hiddify</a></p></section>
+<section><h2>Keenetic / XKeen / Xray</h2>
+<p><a href="/xkeen/{token}" download="04_outbounds.json">Скачать 04_outbounds.json для роутера</a></p>
+<p>Сохрани резервную копию текущего файла и замени
+<code>/opt/etc/xray/configs/04_outbounds.json</code>. Это исходящие подключения;
+XKeen и Xray уже должны быть установлены. Теги: <code>vless-reality</code>, <code>direct</code>, <code>block</code>.
+В существующих правилах маршрутизации должен использоваться <code>vless-reality</code>.</p>
+<p>Перед перезапуском проверь полный набор конфигов:</p>
+<pre style="overflow:auto">XRAY_LOCATION_ASSET=/opt/etc/xray/dat xray run -test -confdir /opt/etc/xray/configs &amp;&amp; xkeen -restart</pre>
+<p>Выполняй перезапуск только после успешной проверки. Старый JSON держи вне каталога configs.
+Для новых серверов используй актуальный Xray на роутере: старое ядро может прочитать JSON, но не установить REALITY-соединение.</p>
+</section>
 <script>async function copyKey(id,b){{try{{await navigator.clipboard.writeText(document.getElementById(id).value);b.textContent='Скопировано ✓'}}catch(e){{b.textContent='Выдели и скопируй текст вручную'}}}}</script></html>'''.encode()
 
 
@@ -180,7 +191,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send(200, b"ok\n")
             return
         parts = path.split("/")
-        if len(parts) != 3 or parts[1] not in {"p", "awg", "vpn", "sub"} or not TOKEN.fullmatch(parts[2]):
+        if len(parts) != 3 or parts[1] not in {"p", "awg", "vpn", "sub", "xkeen"} or not TOKEN.fullmatch(parts[2]):
             self.send(404)
             return
         try:
@@ -194,6 +205,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send(200, page(root, name, parts[2]), "text/html; charset=utf-8")
             elif parts[1] == "sub":
                 self.send(200, cfg.upstream(parts[2]))
+            elif parts[1] == "xkeen":
+                self.send(200, read_file(root, f"dist/{name}-04_outbounds.json"),
+                          "application/json; charset=utf-8", filename="04_outbounds.json")
             else:
                 relative = f"awg/clients/{name}.conf" if parts[1] == "awg" else f"dist/{name}.vpn"
                 self.send(200, read_file(root, relative), filename=f"{name}.{parts[1] if parts[1] == 'vpn' else 'conf'}")

@@ -18,6 +18,8 @@ case "$*" in
 esac
 [[ $EUID -eq 0 ]] || fail 'Run as root.'
 [[ -f "$HERE/vpnctl.py" && -f "$HERE/provision.py" && -f "$HERE/aggsub.py" && -f "$HERE/bootstrap_tls.py" ]] || fail 'Clone/download the COMPLETE repository and run bash install.sh there.'
+[[ -f "$HERE/xray_profile.py" && -f "$HERE/reality_setup.py" ]] || fail 'Missing REALITY/XKeen helpers; use a complete checkout.'
+[[ -f "$HERE/awg_kernel_compat.py" ]] || fail 'Missing AWG compatibility helper; use a complete checkout.'
 exec 9>/run/server-init.lock
 flock -n 9 || fail 'Another installer/maintenance operation is active.'
 # Never mutate an existing or partially installed VPN, even when secrets.env is missing.
@@ -42,24 +44,31 @@ if command -v nft >/dev/null && [[ -n "$(nft list ruleset)" ]]; then fail 'Exist
 chmod 600 "$LOG"
 trap 'printf "ERROR: installation stopped at line %s. Log: %s. Existing identity state is retained; do not delete it to retry.\n" "$LINENO" "$LOG" >&2' ERR
 export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l
-export SNI_DONOR="${SNI_DONOR:-www.nvidia.com}" VLESS_PORT="${VLESS_PORT:-7443}" SRV_LABEL="${SRV_LABEL:-S1}"
-if [[ "$RESUME_FROM_TLS" == 0 && -t 0 ]]; then
-  read -r -p "Reality donor [$SNI_DONOR]: " answer || answer=''
-  SNI_DONOR="${answer:-$SNI_DONOR}"
-  read -r -p "VLESS TCP port [$VLESS_PORT]: " answer || answer=''
-  VLESS_PORT="${answer:-$VLESS_PORT}"
-fi
-XUI_VERSION="${XUI_VERSION:-v3.2.8}"
+export SRV_LABEL="${SRV_LABEL:-S1}"
+XUI_VERSION="${XUI_VERSION:-v3.11.0}"
 [[ "$XUI_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail 'Specify a release tag for XUI_VERSION; floating latest is not supported.'
+XRAY_VERSION="${XRAY_VERSION:-v26.11.9}"
+if [[ "$XRAY_VERSION" == v26.11.9 ]]; then
+  XRAY_SHA256="${XRAY_SHA256:-b651f7e1d9966ee2c1b1ee1bf8b52c72771824d3065dce96bbc8bcc19ed95f82}"
+fi
+[[ "$XRAY_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ && "${XRAY_SHA256:-}" =~ ^[a-f0-9]{64}$ ]] || fail 'Custom XRAY_VERSION requires its verified Linux-64 archive XRAY_SHA256.'
 if [[ "$RESUME_BEFORE_IDENTITIES" == 0 ]]; then
   step 'Install dependencies (no full apt upgrade or automatic reboot)'
   apt-get update >>"$LOG" 2>&1
   apt-get install -y python3 curl jq qrencode openssl ca-certificates nftables socat sqlite3 software-properties-common >>"$LOG" 2>&1
+  step 'Choose and verify REALITY target, port and fingerprint'
+  REALITY_SELECTION=$(python3 "$HERE/reality_setup.py") || fail 'REALITY preflight failed; no VPN identities generated. Set another SNI_DONOR or VLESS_PORT and retry.'
+  # Only validated, shell-quoted public values from our own helper.
+  eval "$REALITY_SELECTION"
   step 'Install AmneziaWG for the running kernel'
   add-apt-repository -y ppa:amnezia/ppa >>"$LOG" 2>&1
   apt-get update >>"$LOG" 2>&1
   apt-get install -y "linux-headers-$(uname -r)" >>"$LOG" 2>&1
-  apt-get install -y amneziawg amneziawg-tools >>"$LOG" 2>&1
+  if ! apt-get install -y amneziawg amneziawg-tools >>"$LOG" 2>&1; then
+    step 'Retry known AWG DKMS source with the verified upstream Ubuntu compatibility fix'
+    python3 "$HERE/awg_kernel_compat.py" >>"$LOG" 2>&1
+    apt-get install -y amneziawg amneziawg-tools >>"$LOG" 2>&1
+  fi
   modprobe amneziawg
   command -v awg >/dev/null
   command -v awg-quick >/dev/null
@@ -68,13 +77,43 @@ if [[ "$RESUME_BEFORE_IDENTITIES" == 0 ]]; then
   step "Install pinned 3x-ui $XUI_VERSION"
   curl -fLSs --connect-timeout 10 --max-time 120 --retry 2 "https://raw.githubusercontent.com/mhsanaei/3x-ui/$XUI_VERSION/install.sh" -o "$WORKDIR/xui-installer.sh"
   bash -n "$WORKDIR/xui-installer.sh"
-  bash "$WORKDIR/xui-installer.sh" "$XUI_VERSION" </dev/null >>"$LOG" 2>&1
+  XUI_NONINTERACTIVE=1 XUI_SSL_MODE=none XUI_ENABLE_FAIL2BAN=false bash "$WORKDIR/xui-installer.sh" "$XUI_VERSION" </dev/null >>"$LOG" 2>&1
   [[ -x /usr/local/x-ui/x-ui ]] || fail '3x-ui binary missing.'
+  step "Install pinned Xray $XRAY_VERSION (SHA256 verified)"
+  XRAY_ARCHIVE=$(mktemp /tmp/server-init-xray.XXXXXX.zip)
+  export XRAY_ARCHIVE
+  trap 'rm -f -- "$XRAY_ARCHIVE"' EXIT
+  curl -fLSs --connect-timeout 10 --max-time 120 --retry 2 "https://github.com/XTLS/Xray-core/releases/download/$XRAY_VERSION/Xray-linux-64.zip" -o "$XRAY_ARCHIVE"
+  printf '%s  %s\n' "$XRAY_SHA256" "$XRAY_ARCHIVE" | sha256sum --check >>"$LOG" 2>&1
+  systemctl stop x-ui
+  python3 - <<'PYXRAY'
+from pathlib import Path
+import os, subprocess, tempfile, zipfile
+binaries = list(Path('/usr/local/x-ui/bin').glob('xray-linux-*'))
+if len(binaries) != 1:
+    raise SystemExit('Expected exactly one installed Xray binary')
+fd, temporary = tempfile.mkstemp(prefix='.xray-new-', dir=binaries[0].parent)
+try:
+    with os.fdopen(fd, 'wb') as stream, zipfile.ZipFile(os.environ['XRAY_ARCHIVE']) as archive:
+        stream.write(archive.read('xray'))
+        os.fchmod(stream.fileno(), 0o755)
+        stream.flush()
+        os.fsync(stream.fileno())
+    subprocess.run([temporary, 'version'], check=True, capture_output=True, timeout=10)
+    os.replace(temporary, binaries[0])
+finally:
+    Path(temporary).unlink(missing_ok=True)
+PYXRAY
+  rm -f "$XRAY_ARCHIVE"
 else
   step 'Continue saved bootstrap (packages and 3x-ui are NOT reinstalled)'
   for tool in awg awg-quick curl jq qrencode openssl nft socat sqlite3; do
     command -v "$tool" >/dev/null || fail "Missing dependency $tool; bootstrap cannot continue."
   done
+  if [[ "$RESUME_FROM_TLS" == 0 ]]; then
+    REALITY_SELECTION=$(python3 "$HERE/reality_setup.py") || fail 'REALITY preflight failed.'
+    eval "$REALITY_SELECTION"
+  fi
 fi
 if [[ "$RESUME_FROM_TLS" == 1 ]]; then
   python3 "$HERE/bootstrap_tls.py" safe-env > "$WORKDIR/.resume-safe.env"
@@ -170,9 +209,10 @@ from vpnctl import ROOT, load_env, atomic, run
 state=load_env(ROOT/'secrets.env')
 with socket.socket() as sock:
     sock.bind(('127.0.0.1',0)); port=sock.getsockname()[1]
-config={'log':{'loglevel':'error'},'inbounds':[{'listen':'127.0.0.1','port':port,'protocol':'socks','settings':{'udp':True}}],
-'outbounds':[{'protocol':'vless','settings':{'vnext':[{'address':'127.0.0.1','port':int(state['VLESS_PORT']),'users':[{'id':json.loads(state['CLIENTS_JSON'])[0]['uuid'],'encryption':'none','flow':'xtls-rprx-vision'}]}]},
-'streamSettings':{'network':'tcp','security':'reality','realitySettings':{'serverName':state['SNI_DONOR'],'publicKey':state['REALITY_PUBLIC_KEY'],'shortId':state['REALITY_SHORT_ID'],'fingerprint':'chrome','spiderX':'/'}}}]}
+person=json.loads(state['CLIENTS_JSON'])[0]
+config=json.loads((ROOT/f"dist/{person['name']}-04_outbounds.json").read_text())
+config['outbounds'][0]['settings']['vnext'][0]['address']='127.0.0.1'
+config.update(log={'loglevel':'error'},inbounds=[{'listen':'127.0.0.1','port':port,'protocol':'socks','settings':{'udp':True}}])
 import subprocess,time
 probe=ROOT/'.probe.json'; atomic(probe,json.dumps(config))
 binary=next(Path('/usr/local/x-ui/bin').glob('xray-linux-*'))
@@ -199,7 +239,7 @@ people=json.loads(s['CLIENTS_JSON'])
 text=f"# VPN handoff\nPanel: https://{s['PANEL_HOST']}:{s['PANEL_PORT']}{s['PANEL_PATH']}\nLogin: {s['PANEL_USER']}\nPassword: {s['PANEL_PASS']}\n\nPersonal pages:\n"
 text+=''.join(f"{p['name']}: https://{s['PANEL_HOST']}:{s['AGG_PORT']}/p/{p['sub']}\n" for p in people)
 text+="\nRaw files on server:\n"
-text+=''.join(f"{p['name']}: /root/vpn-setup/dist/{p['name']}.vpn ; /root/vpn-setup/dist/{p['name']}.vless\n" for p in people)
+text+=''.join(f"{p['name']}: /root/vpn-setup/dist/{p['name']}.vpn ; /root/vpn-setup/dist/{p['name']}.vless ; /root/vpn-setup/dist/{p['name']}-04_outbounds.json\n" for p in people)
 atomic('/root/vpn-handoff.md',text)
 PY
 if [[ -t 1 ]]; then

@@ -7,6 +7,12 @@ permissions:
   contents: read
 jobs:
   integration:
+    strategy:
+      fail-fast: false
+      matrix:
+        transport: [tcp, xhttp]
+    env:
+      VLESS_TRANSPORT: ${{ matrix.transport }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -14,7 +20,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Real ACME, panel, Xray, kernel AWG and recovery
-        run: sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,RUNNER_TEMP,GITHUB_WORKSPACE /usr/bin/python3 tests/integration_bootstrap.py
+        run: sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,RUNNER_TEMP,GITHUB_WORKSPACE,VLESS_TRANSPORT /usr/bin/python3 tests/integration_bootstrap.py
       - name: Make only redacted reports readable by artifact uploader
         if: always()
         run: |
@@ -25,7 +31,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: bootstrap-integration
+          name: bootstrap-integration-${{ matrix.transport }}
           retention-days: 7
           path: |
             integration-results.txt

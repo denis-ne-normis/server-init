@@ -21,6 +21,7 @@ import zlib
 
 from vpnctl import ROOT, AWG_CONF, atomic, run, validate_state, NAME
 import awg_profile
+import xray_profile
 
 OBFS = {"Jc": "5", "Jmin": "10", "Jmax": "50", "S1": "128", "S2": "96", "S3": "41", "S4": "5",
         "H1": "1710377591-1722398516", "H2": "1818569401-2116313076",
@@ -103,13 +104,15 @@ def new_state(env, xray):
     state = {"PANEL_PORT": env.get("PANEL_PORT", str(20000 + secrets.randbelow(40000))),
              "PANEL_USER": "admin_" + secrets.token_hex(4), "PANEL_PASS": secrets.token_urlsafe(32),
              "PANEL_PATH_RAW": secrets.token_hex(12), "SNI_DONOR": env.get("SNI_DONOR", "www.nvidia.com"),
-             "VLESS_PORT": env.get("VLESS_PORT", "7443"), "AWG_PORT": env.get("AWG_PORT", "39743"),
+             "VLESS_PORT": env.get("VLESS_PORT", "443"), "AWG_PORT": env.get("AWG_PORT", "39743"),
              "AWG_SUBNET": env.get("AWG_SUBNET", "10.9.7"), "SUB_PORT": env.get("SUB_PORT", "2096"),
              "AGG_PORT": env.get("AGG_PORT", "2087"), "SRV_LABEL": env.get("SRV_LABEL", "S1"),
              "PANEL_HOST": env["PUBIP"], "BLOCK_SMTP": env.get("BLOCK_SMTP", "1"),
              "AWG_MTU": env.get("AWG_MTU", "1280" if env.get("AWG_PROTOCOL", "3.1") == "3.1" else "1376"),
              "REALITY_PRIVATE_KEY": private, "REALITY_PUBLIC_KEY": public,
-             "REALITY_SHORT_ID": secrets.token_hex(8), "CLIENTS_JSON": json.dumps(people, separators=(",", ":"))}
+             "REALITY_SHORT_ID": secrets.token_hex(8), "REALITY_FINGERPRINT": env.get("REALITY_FINGERPRINT", "chrome"),
+             "VLESS_TRANSPORT": env.get("VLESS_TRANSPORT", "tcp"), "XHTTP_PATH": env.get("XHTTP_PATH", "/" + secrets.token_hex(16)),
+             "CLIENTS_JSON": json.dumps(people, separators=(",", ":"))}
     state["AWG_PROTOCOL"] = env.get("AWG_PROTOCOL", "3.1")
     if awg_profile.version(state) == "3.1":
         state["AWG_PARAMETERS"] = json.dumps(awg_profile.new_profile(), sort_keys=True)
@@ -161,10 +164,9 @@ def render(bundle, root=ROOT, awg_conf=AWG_CONF, qr=True):
                   f"AllowedIPs = 0.0.0.0/0, ::/0\nEndpoint = {state['PANEL_HOST']}:{state['AWG_PORT']}\nPersistentKeepalive = {awg_profile.keepalive(state)}\n")
         name = client["name"]
         atomic(root / f"awg/clients/{name}.conf", config)
-        link = (f"vless://{client['uuid']}@{state['PANEL_HOST']}:{state['VLESS_PORT']}?encryption=none&flow=xtls-rprx-vision"
-                f"&fp=chrome&pbk={state['REALITY_PUBLIC_KEY']}&security=reality&sid={state['REALITY_SHORT_ID']}"
-                f"&sni={state['SNI_DONOR']}&spx=%2F#{state['SRV_LABEL']}-{name}")
+        link = xray_profile.share_link(state, client)
         atomic(root / f"dist/{name}.vless", link)
+        atomic(root / f"dist/{name}-04_outbounds.json", json.dumps(xray_profile.xkeen_config(link, state, client), indent=2) + "\n")
         atomic(root / f"dist/{name}.vpn", amnezia_key(state, client, config, bundle["server_public"]))
         if qr:
             run(["qrencode", "-s", "8", "-m", "2", "-o", root / f"dist/{name}-vless.png"], data=link)
@@ -172,18 +174,23 @@ def render(bundle, root=ROOT, awg_conf=AWG_CONF, qr=True):
     atomic(root / "awg/submap.tsv", "".join(f"{p['sub']}\t{p['name']}\n" for p in bundle["clients"]))
     atomic(root / "awg/label", state["SRV_LABEL"])
     atomic(root / "secrets.env", "".join(f"{k}={shlex.quote(v)}\n" for k, v in state.items()))
-    clients = [{"id": p["uuid"], "flow": "xtls-rprx-vision", "email": p["name"], "limitIp": 0,
+    clients = [{"id": p["uuid"], "flow": xray_profile.flow(state), "email": p["name"], "limitIp": 0,
                 "totalGB": 0, "expiryTime": 0, "enable": True, "tgId": "", "subId": p["sub"], "comment": "", "reset": 0}
                for p in bundle["clients"]]
     reality = {"show": False, "target": state["SNI_DONOR"] + ":443", "xver": 0,
                "serverNames": [state["SNI_DONOR"]], "privateKey": state["REALITY_PRIVATE_KEY"],
-               "shortIds": [state["REALITY_SHORT_ID"]], "settings": {"publicKey": state["REALITY_PUBLIC_KEY"], "fingerprint": "chrome", "spiderX": "/"}}
+               "shortIds": [state["REALITY_SHORT_ID"]], "settings": {"publicKey": state["REALITY_PUBLIC_KEY"], "fingerprint": xray_profile.fingerprint(state), "spiderX": "/"}}
     inbound = {"enable": True, "remark": "VLESS-Reality-Vision", "listen": "", "port": int(state["VLESS_PORT"]),
                "protocol": "vless", "expiryTime": 0,
                "settings": json.dumps({"clients": clients, "decryption": "none", "fallbacks": []}),
                "streamSettings": json.dumps({"network": "tcp", "security": "reality", "realitySettings": reality,
                                               "tcpSettings": {"acceptProxyProtocol": False, "header": {"type": "none"}}}),
                "sniffing": json.dumps({"enabled": True, "destOverride": ["http", "tls", "quic"], "metadataOnly": False, "routeOnly": False})}
+    if xray_profile.transport(state) == "xhttp":
+        stream = json.loads(inbound["streamSettings"])
+        stream.pop("tcpSettings")
+        stream.update(network="xhttp", xhttpSettings={"path": xray_profile.xhttp_path(state), "mode": "auto"})
+        inbound.update(remark="VLESS-XHTTP-Reality", streamSettings=json.dumps(stream))
     atomic(root / "inbound.json", json.dumps(inbound))
 
 
