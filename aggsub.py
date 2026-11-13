@@ -153,8 +153,7 @@ a{{color:#a9cbff}}button{{padding:12px;margin:10px 0}}small{{color:#b0b9cc}}
 XKeen и Xray уже должны быть установлены. Теги: <code>vless-reality</code>, <code>direct</code>, <code>block</code>.
 В существующих правилах маршрутизации должен использоваться <code>vless-reality</code>.</p>
 <p>Перед перезапуском проверь полный набор конфигов:</p>
-<pre style="overflow:auto">xray run -test -confdir /opt/etc/xray/configs
-xkeen -restart</pre>
+<pre style="overflow:auto">XRAY_LOCATION_ASSET=/opt/etc/xray/dat xray run -test -confdir /opt/etc/xray/configs &amp;&amp; xkeen -restart</pre>
 <p>Выполняй перезапуск только после успешной проверки. Старый JSON держи вне каталога configs.
 Для новых серверов используй актуальный Xray на роутере: старое ядро может прочитать JSON, но не установить REALITY-соединение.</p>
 </section>
