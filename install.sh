@@ -19,6 +19,7 @@ esac
 [[ $EUID -eq 0 ]] || fail 'Run as root.'
 [[ -f "$HERE/vpnctl.py" && -f "$HERE/provision.py" && -f "$HERE/aggsub.py" && -f "$HERE/bootstrap_tls.py" ]] || fail 'Clone/download the COMPLETE repository and run bash install.sh there.'
 [[ -f "$HERE/xray_profile.py" && -f "$HERE/reality_setup.py" ]] || fail 'Missing REALITY/XKeen helpers; use a complete checkout.'
+[[ -f "$HERE/awg_kernel_compat.py" ]] || fail 'Missing AWG compatibility helper; use a complete checkout.'
 exec 9>/run/server-init.lock
 flock -n 9 || fail 'Another installer/maintenance operation is active.'
 # Never mutate an existing or partially installed VPN, even when secrets.env is missing.
@@ -63,7 +64,11 @@ if [[ "$RESUME_BEFORE_IDENTITIES" == 0 ]]; then
   add-apt-repository -y ppa:amnezia/ppa >>"$LOG" 2>&1
   apt-get update >>"$LOG" 2>&1
   apt-get install -y "linux-headers-$(uname -r)" >>"$LOG" 2>&1
-  apt-get install -y amneziawg amneziawg-tools >>"$LOG" 2>&1
+  if ! apt-get install -y amneziawg amneziawg-tools >>"$LOG" 2>&1; then
+    step 'Retry known AWG DKMS source with the verified upstream Ubuntu compatibility fix'
+    python3 "$HERE/awg_kernel_compat.py" >>"$LOG" 2>&1
+    apt-get install -y amneziawg amneziawg-tools >>"$LOG" 2>&1
+  fi
   modprobe amneziawg
   command -v awg >/dev/null
   command -v awg-quick >/dev/null

@@ -70,6 +70,9 @@ def snapshot():
 
 def redact_log():
     text = PRIVATE.read_text() if PRIVATE.exists() else ''
+    build_log = Path('/var/lib/dkms/amneziawg/1.0.0/build/make.log')
+    if build_log.exists():
+        text += '\nAWG DKMS build log:\n' + build_log.read_text(errors='replace')[-16000:]
     if (vpnctl.ROOT / 'state.json').exists():
         bundle = json.loads((vpnctl.ROOT / 'state.json').read_text())
         fields = list(bundle['settings'].values())
@@ -99,7 +102,11 @@ def main():
              'qrencode', 'nftables', 'software-properties-common', 'iproute2', f'linux-headers-{os.uname().release}'], env=env)
     command(['add-apt-repository', '-y', 'ppa:amnezia/ppa'], env=env)
     command(['apt-get', 'update'], env=env)
-    command(['apt-get', 'install', '-y', 'amneziawg', 'amneziawg-tools'], env=env)
+    package_args = ['apt-get', 'install', '-y', 'amneziawg', 'amneziawg-tools']
+    if command(package_args, env=env, check=False).returncode:
+        note('Retry AWG package with checksum-verified upstream compatibility fix')
+        command([sys.executable, SOURCE / 'awg_kernel_compat.py'])
+        command(package_args, env=env)
     command(['modprobe', 'amneziawg'])
     note('PASS real AmneziaWG packages and running-kernel module')
     # Reset runner's Docker-created rules, never a persistent/user host firewall.
