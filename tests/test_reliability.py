@@ -288,10 +288,12 @@ class HTTPTests(unittest.TestCase):
         self.assertEqual(self.get(f"/p/{TOKEN}")[0], 200)
 
     def test_actual_http_upstream_and_custom_port(self):
-        payload = base64.b64encode(b"vless://test@127.0.0.1:7443\n")
+        payload = base64.b64encode(b"vless://test@203.0.113.10:7443\n")
+        hosts = []
         class Backend(BaseHTTPRequestHandler):
             def log_message(self, *args): pass
             def do_GET(self):
+                hosts.append(self.headers.get("Host"))
                 self.send_response(200)
                 self.end_headers()
                 self.wfile.write(payload)
@@ -300,7 +302,9 @@ class HTTPTests(unittest.TestCase):
         thread.start()
         try:
             self.cfg.sub_port = backend.server_address[1]
+            self.cfg.sub_host = "203.0.113.10"
             self.assertEqual(self.get(f"/sub/{TOKEN}")[2], payload)
+            self.assertEqual(hosts, ["203.0.113.10"])
         finally:
             backend.shutdown(); backend.server_close(); thread.join(2)
 

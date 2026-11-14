@@ -234,6 +234,7 @@ def verify_exports(state):
 
 def subscription_environment(state, settings):
     """Validate the existing backend without silently changing panel settings."""
+    from aggsub import subscription_host
     sub_port = settings.get("subPort", "2096")
     if not 1 <= int(sub_port) <= 65535:
         raise ValueError("invalid actual subscription port")
@@ -249,7 +250,8 @@ def subscription_environment(state, settings):
         raise ValueError("subscription TLS needs both certificate and key")
     env = {"AGG_PORT": state["AGG_PORT"], "AGG_CERT": str(ETC / "tls/cert.pem"),
            "AGG_KEY": str(ETC / "tls/key.pem"), "SUB_PORT": sub_port,
-           "SUB_SCHEME": "https" if cert else "http", "SUB_PATH": sub_path}
+           "SUB_SCHEME": "https" if cert else "http", "SUB_PATH": sub_path,
+           "SUB_HOST": subscription_host(settings.get("subDomain") or settings.get("webDomain") or state["PANEL_HOST"])}
     if cert:
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.load_cert_chain(cert, key)

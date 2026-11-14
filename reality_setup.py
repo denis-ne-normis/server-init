@@ -16,7 +16,7 @@ import time
 
 from xray_profile import donor_name, FINGERPRINTS
 
-DONORS = ("www.microsoft.com", "www.apple.com", "www.nvidia.com")
+DONORS = ("www.microsoft.com", "www.ibm.com", "www.nvidia.com")
 
 
 def probe(host):
@@ -26,7 +26,7 @@ def probe(host):
         result = subprocess.run(
             ["openssl", "s_client", "-connect", host + ":443", "-servername", host,
              "-tls1_3", "-alpn", "h2", "-verify_hostname", host, "-verify_return_error"],
-            input="", capture_output=True, text=True, timeout=12)
+            input="", capture_output=True, text=True, errors="replace", timeout=12)
     except (OSError, subprocess.TimeoutExpired):
         return False, 0, "TLS-проверка недоступна или таймаут 12 с"
     output = result.stdout + result.stderr
