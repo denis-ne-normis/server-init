@@ -71,8 +71,7 @@ systemd и заголовки **работающего** ядра. Debian бол
 ```bash
 git clone https://github.com/denis-ne-normis/server-init.git &&
 cd server-init &&
-sudo env SSH_CONNECTION="$SSH_CONNECTION" \
-   bash install.sh
+sudo env SSH_CONNECTION="$SSH_CONNECTION" bash install.sh
 ```
 ```bash
 sudo env SSH_CONNECTION="$SSH_CONNECTION" bash install.sh
